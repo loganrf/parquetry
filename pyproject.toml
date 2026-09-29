@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "parquetry"
+dynamic = ["version"]
+description = "Explore, aggregate and export large Parquet files - desktop UI plus a scriptable CLI."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Logan" }]
+keywords = ["parquet", "polars", "csv", "time-series", "telemetry", "plotting"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Environment :: X11 Applications :: Qt",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+# The core (CLI + processing engine) only needs polars and numpy so that
+# automated/headless processing does not pull in Qt.
+dependencies = [
+    "polars>=1.20",
+    "numpy>=1.24",
+    # zoneinfo needs a time zone database, which Windows does not provide.
+    "tzdata; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+ui = [
+    "PySide6-Essentials>=6.5",
+    "pyqtgraph>=0.13.3",
+]
+metadata = [
+    # Optional: richer file details (row groups, compression, writer) in `info`
+    # and in the file browser preview.
+    "pyarrow>=14",
+]
+all = ["parquetry[ui,metadata]"]
+test = [
+    "pytest>=7",
+    "pytest-qt>=4.2",
+]
+# Standalone desktop bundles (see packaging/ and .github/workflows/release.yml).
+package = [
+    "parquetry[ui]",
+    "pyinstaller>=6.10",
+    "pillow>=10",  # converts the rendered icon to .ico/.icns
+]
+
+[project.scripts]
+parquetry = "parquetry.cli:main"
+
+[project.gui-scripts]
+parquetry-gui = "parquetry.ui.app:main"
+
+[tool.hatch.version]
+path = "src/parquetry/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/parquetry"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+qt_api = "pyside6"
