@@ -111,6 +111,36 @@ def format_x(value: Any, kind: str) -> str:
     return str(int(value)) if value.is_integer() else repr(value)
 
 
+_ISO = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:[.,](\d+))?)?)?\s*(Z|[+-]\d{2}(?::?\d{2})?)?$",
+    re.IGNORECASE,
+)
+
+
+def _parse_iso(text: str) -> dt.datetime:
+    """ISO 8601 date/time, including forms Python 3.10's fromisoformat rejects
+    (e.g. ``12:00:00.1``, ``Z`` suffix, ``+0100`` offsets)."""
+    try:
+        return dt.datetime.fromisoformat(text)
+    except ValueError:
+        match = _ISO.match(text)
+        if not match:
+            raise
+    year, month, day, hour, minute, second, fraction, offset = match.groups()
+    tzinfo = None
+    if offset:
+        if offset.upper() == "Z":
+            tzinfo = UTC
+        else:
+            digits = offset[1:].replace(":", "").ljust(4, "0")
+            delta = dt.timedelta(hours=int(digits[:2]), minutes=int(digits[2:]))
+            tzinfo = dt.timezone(-delta if offset[0] == "-" else delta)
+    return dt.datetime(
+        int(year), int(month), int(day), int(hour or 0), int(minute or 0), int(second or 0),
+        int((fraction or "0")[:6].ljust(6, "0")), tzinfo=tzinfo,
+    )
+
+
 def parse_x_value(value: Any, kind: str, tz: str | None = None) -> Any:
     """Parse an absolute range bound for an x column of the given kind."""
     if kind != "datetime":
@@ -125,11 +155,8 @@ def parse_x_value(value: Any, kind: str, tz: str | None = None) -> Any:
     elif isinstance(value, (int, float)) and not isinstance(value, bool):
         return from_epoch_us(round(value * 1e6), tz)  # epoch seconds
     else:
-        text = str(value).strip()
-        if text.endswith(("Z", "z")):
-            text = text[:-1] + "+00:00"
         try:
-            parsed = dt.datetime.fromisoformat(text)
+            parsed = _parse_iso(str(value).strip())
         except ValueError:
             raise ProcessingError(
                 f"Cannot parse {value!r} as a date/time; use ISO 8601 such as 2024-01-31T12:00:00"

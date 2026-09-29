@@ -19,6 +19,7 @@ from parquetry.processing import (
     find_inputs,
     load_plot_data,
     merge_plot_data,
+    parse_x_value,
     plan_outputs,
     preview_csv,
     render_output_path,
@@ -87,6 +88,21 @@ def test_relative_ranges_and_open_ends(telemetry):
 def test_range_end_before_start(telemetry):
     with pytest.raises(ProcessingError, match="end is before start"):
         run(telemetry, cfg(ranges=[TimeRange("2024-01-01T00:00:20", "2024-01-01T00:00:10")]))
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("2024-01-01T00:00:00.1", dt.datetime(2024, 1, 1, 0, 0, 0, 100000)),
+        ("2024-01-01 12:30", dt.datetime(2024, 1, 1, 12, 30)),
+        ("2024-01-01", dt.datetime(2024, 1, 1)),
+        ("2024-01-01T01:00:00.123456789Z", dt.datetime(2024, 1, 1, 1, 0, 0, 123456)),
+        ("2024-01-01T02:00:00+0100", dt.datetime(2024, 1, 1, 1, 0, 0)),
+        ("2024-01-01T00:00:00-05:30", dt.datetime(2024, 1, 1, 5, 30, 0)),
+    ],
+)
+def test_parse_iso_variants(text, expected):
+    assert parse_x_value(text, "datetime") == expected  # naive column: converted to UTC
 
 
 def test_bad_range_value(telemetry):
