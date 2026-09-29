@@ -214,3 +214,16 @@ def test_mouse_readout(explorer, qtbot):
     explorer.plot._on_mouse_moved((center,))
     assert "2024-01-01" in explorer.plot.readout.text()
     assert "speed" in explorer.plot.readout.text()
+
+
+def test_changing_x_clears_stale_plot_and_ranges(explorer, qtbot):
+    from parquetry.dataset import ROW_INDEX
+
+    explorer.plot.add_range(EPOCH_START + 10, EPOCH_START + 20)
+    explorer.ranges_panel.set_mode("relative")
+    explorer.params.set_x(ROW_INDEX)
+    assert explorer.plot.ranges() == [] and explorer.plot.data is None  # nothing to select on until reloaded
+    explorer.plot.add_range(10, 20)
+    assert explorer.current_config().ranges[0].to_dict() == {"start": 10.0, "end": 20.0}
+    idle(qtbot)
+    qtbot.waitUntil(lambda: explorer.plot.data is not None and explorer.plot.data.x_kind == "numeric", timeout=10000)

@@ -22,6 +22,7 @@ from ..dataset import DatasetInfo, format_bytes
 from ..processing import (
     PlotData,
     ProcessingError,
+    data_bounds,
     format_x,
     load_plot_data,
     merge_plot_data,
@@ -282,6 +283,10 @@ class ExplorerPage(QWidget):
             if self.plot.ranges():
                 self.status.emit("Ranges cleared because the x axis changed")
             self.plot.clear_ranges()
+            # The old data is in different x units; don't let ranges be drawn on it.
+            self._overview = self.plot_data = None
+            self.plot.set_data(None, keep_view=False, message="Loading…")
+            self._update_detail_banner()
         self.schedule_update()
 
     # ------------------------------------------------------------------- plot
@@ -303,7 +308,7 @@ class ExplorerPage(QWidget):
         x = self.params.x()
         kind = self.info.x_kind(x)
         tz = self.info.column(x).time_zone
-        start = self.plot.data.bounds[0] if self.plot.data and self.plot.data.bounds else None
+        start = self._data_start(x) if mode == "relative" else None
         out = []
         for entry in self.plot.ranges():
             if mode == "relative" and start is not None:
@@ -319,6 +324,14 @@ class ExplorerPage(QWidget):
             else:
                 out.append(TimeRange(entry.lo, entry.hi, entry.label))
         return out
+
+    def _data_start(self, x: str) -> float | None:
+        """First x value in plot units (from the plot if it shows *x*)."""
+        data = self.plot.data
+        if data is not None and data.x_name == x and data.bounds:
+            return data.bounds[0]
+        bounds = data_bounds(self.info, x)
+        return x_to_plot(bounds.lo, self.info.x_kind(x)) if bounds else None
 
     def schedule_update(self) -> None:
         if self.info is None:

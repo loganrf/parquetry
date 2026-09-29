@@ -130,11 +130,11 @@ class PlotArea(QWidget):
     def kind(self) -> str:
         return self.data.x_kind if self.data else "numeric"
 
-    def set_data(self, data: PlotData | None, keep_view: bool = True) -> None:
+    def set_data(self, data: PlotData | None, keep_view: bool = True, message: str | None = None) -> None:
         view = self.view_range() if keep_view and self._plots else None
         self.data = data
         self._assign_colors()
-        self._rebuild()
+        self._rebuild(message)
         if view is not None and self._plots:
             self.set_x_view(*view, padding=0)
 
@@ -177,14 +177,14 @@ class PlotArea(QWidget):
             groups.setdefault(series.column if self.stacked else "", []).append(series)
         return groups
 
-    def _rebuild(self) -> None:
+    def _rebuild(self, message: str | None = None) -> None:
         self.glw.clear()
         self._plots, self._vlines, self._previews = [], [], []
         self._placeholder = None
         for entry in self._ranges:
             entry.regions, entry.tag = [], None
         if not self.data or not self.data.series:
-            self._show_placeholder("Select one or more parameters to plot")
+            self._show_placeholder(message or "Select one or more parameters to plot")
             return
         groups = self._groups()
         for row, (column, series_list) in enumerate(groups.items()):
