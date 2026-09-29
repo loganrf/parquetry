@@ -215,7 +215,7 @@ class AggregationPanel(QGroupBox):
         self.method_combo.currentIndexChanged.connect(self._method_changed)
 
         self.n_spin = QSpinBox()
-        self.n_spin.setRange(2, 1_000_000_000)
+        self.n_spin.setRange(1, 2_000_000_000)
         self.n_spin.setValue(10)
         self.n_spin.setPrefix("every ")
         self.n_spin.setSuffix(" rows")
@@ -223,7 +223,7 @@ class AggregationPanel(QGroupBox):
         self.every_edit = QLineEdit("1s")
         self.every_edit.textChanged.connect(self._every_changed)
         self.points_spin = QSpinBox()
-        self.points_spin.setRange(1, 100_000_000)
+        self.points_spin.setRange(1, 2_000_000_000)
         self.points_spin.setSingleStep(500)
         self.points_spin.setValue(2000)
         self.points_spin.setSuffix(" buckets")
@@ -294,7 +294,7 @@ class AggregationPanel(QGroupBox):
             w.blockSignals(True)
         try:
             self.method_combo.setCurrentIndex(max(0, self.method_combo.findData(agg.method)))
-            self.n_spin.setValue(max(2, agg.n))
+            self.n_spin.setValue(agg.n)
             self.every_edit.setText(str(agg.every))
             self.points_spin.setValue(agg.points)
             for name, box in self.func_boxes.items():

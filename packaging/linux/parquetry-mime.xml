@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Lets desktops recognise Parquet files so the .desktop entry can open them. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/vnd.apache.parquet">
+    <comment>Apache Parquet file</comment>
+    <alias type="application/x-parquet"/>
+    <magic priority="50">
+      <match type="string" offset="0" value="PAR1"/>
+    </magic>
+    <glob pattern="*.parquet"/>
+    <glob pattern="*.parq"/>
+    <glob pattern="*.pq"/>
+  </mime-type>
+</mime-info>

@@ -192,9 +192,16 @@ def test_batch_dialog(explorer, qtbot, settings, telemetry, tmp_path):
 
 
 def test_path_to_template(tmp_path):
+    from parquetry.processing import render_output_path
+
     source = tmp_path / "flight.parquet"
     assert path_to_template(tmp_path / "flight_export.csv", source) == "{stem}_export.csv"
     assert path_to_template(tmp_path / "out" / "x.csv", source) == str(tmp_path / "out" / "x.csv")
+    # only a leading stem is generalised; the stem elsewhere in the name stays literal
+    assert path_to_template(tmp_path / "data.csv", tmp_path / "a.parquet") == "data.csv"
+    # literal braces survive the template round trip
+    odd = tmp_path / "exports {2024}" / "flight {x}.csv"
+    assert render_output_path(path_to_template(odd, source), source) == odd
 
 
 def test_save_config_action(explorer, settings, tmp_path, monkeypatch):
@@ -227,3 +234,48 @@ def test_changing_x_clears_stale_plot_and_ranges(explorer, qtbot):
     assert explorer.current_config().ranges[0].to_dict() == {"start": 10.0, "end": 20.0}
     idle(qtbot)
     qtbot.waitUntil(lambda: explorer.plot.data is not None and explorer.plot.data.x_kind == "numeric", timeout=10000)
+
+
+def test_config_ranges_survive_interaction_during_load(explorer, qtbot):
+    cfg = ProcessingConfig(x="time", y=["speed"], range_mode="relative", ranges=[TimeRange(5, 15)])
+    explorer.apply_config(cfg)  # starts a load that resolves the ranges
+    assert explorer.current_config().ranges[0].to_dict() == {"start": 5, "end": 15}  # before they are drawn
+    explorer.params.set_selected_y(["speed", "rpm"])  # supersedes that load
+    explorer.update_plot()
+    idle(qtbot)
+    assert len(explorer.plot.ranges()) == 1
+    assert explorer.current_config().ranges[0].to_dict() == {"start": 5.0, "end": 15.0}
+
+
+def test_pending_ranges_do_not_leak_into_next_file(window, explorer, qtbot, numeric_x):
+    cfg = ProcessingConfig(x="time", y=["speed"], ranges=[TimeRange("2024-01-01T00:00:05", None)],
+                           aggregation=AggregationConfig(method="interval", every="nonsense"))
+    explorer.apply_config(cfg)  # invalid interval: the load never starts
+    errors = []
+    explorer.error.connect(lambda title, text: errors.append(text))
+    window.open_file(numeric_x)
+    idle(qtbot)
+    assert errors == []
+    assert explorer.info.path == numeric_x
+    assert explorer.plot.ranges() == [] and explorer.plot.data.series
+
+
+def test_every_nth_of_one_is_kept(explorer):
+    explorer.aggregation.set_config(AggregationConfig(method="every_nth", n=1))
+    assert explorer.aggregation.config().n == 1
+
+
+def test_os_file_open_event(window, qtbot, telemetry):
+    from PySide6.QtGui import QFileOpenEvent
+    from PySide6.QtWidgets import QApplication
+
+    from parquetry.ui.app import FileOpenHandler
+
+    handler = FileOpenHandler(window)
+    QApplication.instance().installEventFilter(handler)
+    try:
+        QApplication.sendEvent(QApplication.instance(), QFileOpenEvent(str(telemetry)))
+        idle(qtbot)
+        assert window.explorer.info is not None and window.explorer.info.path == telemetry
+    finally:
+        QApplication.instance().removeEventFilter(handler)

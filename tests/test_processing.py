@@ -362,3 +362,25 @@ def test_merge_keeps_unknown_series():
     merged = merge_plot_data(base, detail)
     assert merged.series[0].x.tolist() == [0, 1, 2.5, 4]
     assert merged.series[1] is base.series[1]
+
+
+def test_batch_refuses_outputs_that_collide(telemetry, tmp_path):
+    copy = tmp_path / "copy.parquet"
+    copy.write_bytes(telemetry.read_bytes())
+    config = cfg(output=OutputOptions(path="export.csv"))
+    with pytest.raises(ProcessingError, match="would both be written to"):
+        list(batch_export([telemetry, copy], config))
+    assert not (tmp_path / "export.csv").exists()
+
+
+def test_target_points_buckets_each_range(telemetry):
+    agg = AggregationConfig(method="target_points", points=5, functions=["count"])
+    config = cfg(aggregation=agg, range_mode="relative", ranges=[TimeRange(0, 10), TimeRange(49.9, 59.9)])
+    df = run(telemetry, config)
+    assert df.height == 10
+    assert df["speed"].sum() == 101 + 101
+
+
+def test_target_points_labels_are_exact(telemetry):
+    df = run(telemetry, cfg(aggregation=AggregationConfig(method="target_points", points=599, functions=["first"])))
+    assert df["time"][1] - df["time"][0] == dt.timedelta(milliseconds=100)

@@ -6,11 +6,25 @@ import sys
 from pathlib import Path
 
 import pyqtgraph as pg
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QEvent, QObject, QTimer
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 from .main_window import MainWindow
+
+
+class FileOpenHandler(QObject):
+    """Opens files handed over by the OS (macOS Finder "Open With", double-click)."""
+
+    def __init__(self, window: MainWindow) -> None:
+        super().__init__(window)
+        self._window = window
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 - Qt naming
+        if event.type() == QEvent.Type.FileOpen and event.file():
+            self._window.open_file(Path(event.file()))
+            return True
+        return super().eventFilter(obj, event)
 
 
 def create_app() -> QApplication:
@@ -33,6 +47,7 @@ def run(path: str | None = None, config: str | None = None, quit_after: float | 
     """
     app = create_app()
     window = MainWindow()
+    app.installEventFilter(FileOpenHandler(window))
     window.show()
     if path:
         window.open_file(Path(path), config)

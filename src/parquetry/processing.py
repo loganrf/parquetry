@@ -369,14 +369,19 @@ def _range_predicate(x: str, resolved: Resolved, kind: str, tz: str | None) -> p
     return reduce(operator.or_, terms) if terms else None
 
 
-def _span(info: DatasetInfo, x: str, resolved: Resolved) -> Bounds | None:
+def _range_spans(info: DatasetInfo, x: str, resolved: Resolved) -> list[tuple[pl.Expr, Bounds | None]]:
+    """For every range: a row condition and its extent clipped to the data."""
     data = data_bounds(info, x)
     if data is None or not resolved:
-        return data
-    lo = min(data.lo if a is None else a for a, _ in resolved)
-    hi = max(data.hi if b is None else b for _, b in resolved)
-    lo, hi = max(lo, data.lo), min(hi, data.hi)
-    return Bounds(lo, hi) if lo <= hi else None
+        return [(pl.lit(True), data)]
+    kind, tz = _x_meta(info, x)
+    spans = []
+    for lo, hi in resolved:
+        a = data.lo if lo is None else max(lo, data.lo)
+        b = data.hi if hi is None else min(hi, data.hi)
+        condition = _range_predicate(x, [(lo, hi)], kind, tz)
+        spans.append((pl.lit(True) if condition is None else condition, Bounds(a, b) if a <= b else None))
+    return spans
 
 
 def covered_fraction(info: DatasetInfo, x: str, resolved: Resolved) -> float:
@@ -407,8 +412,9 @@ def _points_bucket(x: str, kind: str, tz: str | None, span: Bounds | None, point
     """Expression assigning each row to one of *points* equal-width buckets."""
     if kind == "datetime":
         lo_us, hi_us = (to_epoch_us(span.lo), to_epoch_us(span.hi)) if span else (0, 0)
-        width = max(1, math.ceil((hi_us - lo_us + 1) / points))
-        expr = pl.from_epoch(((pl.col(x).dt.epoch("us") - lo_us) // width) * width + lo_us, time_unit="us")
+        width = max(1, math.ceil((hi_us - lo_us) / points))
+        index = ((pl.col(x).dt.epoch("us") - lo_us) // width).clip(0, points - 1)
+        expr = pl.from_epoch(index * width + lo_us, time_unit="us")
         if tz:
             expr = expr.dt.replace_time_zone("UTC").dt.convert_time_zone(tz)
         return expr
@@ -430,7 +436,7 @@ def _interval_bucket(x: str, kind: str, width: str | float, integer: bool) -> pl
     return (pl.col(x) / width).floor() * width
 
 
-def _aggregate(lf: pl.LazyFrame, info: DatasetInfo, cfg: ProcessingConfig, span: Bounds | None) -> pl.LazyFrame:
+def _aggregate(lf: pl.LazyFrame, info: DatasetInfo, cfg: ProcessingConfig, resolved: Resolved) -> pl.LazyFrame:
     agg = cfg.aggregation
     if agg.method == "none":
         return lf
@@ -442,7 +448,12 @@ def _aggregate(lf: pl.LazyFrame, info: DatasetInfo, cfg: ProcessingConfig, span:
     if agg.method == "interval":
         bucket = _interval_bucket(x, kind, _interval_width(cfg, info), integer)
     else:
-        bucket = _points_bucket(x, kind, tz, span, agg.points, integer)
+        # Every range gets its own `points` buckets, so separate ranges keep
+        # their resolution instead of sharing one grid over the gap between them.
+        bucket = None
+        for condition, span in _range_spans(info, x, resolved):
+            expr = _points_bucket(x, kind, tz, span, agg.points, integer)
+            bucket = expr if bucket is None else pl.when(condition).then(expr).otherwise(bucket)
     values = []
     for out_name, source, func in cfg.output_columns():
         expr = pl.col(source)
@@ -472,7 +483,7 @@ def processed_frame(
         lf = lf.head(row_limit)
     if cfg.sort if sort is None else sort:
         lf = lf.sort(x)
-    return _aggregate(lf, info, cfg, _span(info, x, resolved))
+    return _aggregate(lf, info, cfg, resolved)
 
 
 def estimate_rows(info: DatasetInfo, cfg: ProcessingConfig, resolved: Resolved | None = None) -> int:
@@ -597,12 +608,13 @@ class OutputPlan:
 
 
 def plan_outputs(
-    info: DatasetInfo,
+    source: DatasetInfo | Path,
     cfg: ProcessingConfig,
     output: str | None = None,
     base_dir: Path | None = None,
 ) -> list[OutputPlan]:
     """Work out which files an export writes (one per range when splitting)."""
+    input_path = source.path if isinstance(source, DatasetInfo) else Path(source)
     template = output or cfg.output.path
     if template == "-":
         if cfg.output.split_ranges and len(cfg.ranges) > 1:
@@ -615,16 +627,40 @@ def plan_outputs(
         plans = []
         for number, rng in enumerate(cfg.ranges, 1):
             label = rng.label or str(number)
-            plans.append(OutputPlan(render_output_path(template, info.path, label, base_dir), [rng], label))
+            plans.append(OutputPlan(render_output_path(template, input_path, label, base_dir), [rng], label))
         paths = [p.path for p in plans]
         if len(set(paths)) != len(paths):
             raise ProcessingError("Several ranges map to the same output file; give the ranges unique labels")
     else:
-        plans = [OutputPlan(render_output_path(template, info.path, "all", base_dir), list(cfg.ranges))]
+        plans = [OutputPlan(render_output_path(template, input_path, "all", base_dir), list(cfg.ranges))]
     for plan in plans:
-        if plan.path is not None and plan.path.resolve() == info.path.resolve():
-            raise ProcessingError(f"Refusing to overwrite the input file {info.path}")
+        if plan.path is not None and plan.path.resolve() == input_path.resolve():
+            raise ProcessingError(f"Refusing to overwrite the input file {input_path}")
     return plans
+
+
+def check_batch_outputs(
+    inputs: Sequence[Path], cfg: ProcessingConfig, output: str | None = None, base_dir: Path | None = None
+) -> None:
+    """Refuse a batch in which two inputs would be written to the same file."""
+    owners: dict[Path, Path] = {}
+    for path in inputs:
+        try:
+            plans = plan_outputs(Path(path), cfg, output, base_dir)
+        except ProcessingError:
+            continue  # reported for that file when it is exported
+        for plan in plans:
+            if plan.path is None:
+                if len(inputs) > 1:
+                    raise ProcessingError("Only a single input file can be written to standard output")
+                continue
+            key = plan.path.resolve()
+            if key in owners and owners[key] != path:
+                raise ProcessingError(
+                    f"{owners[key].name} and {Path(path).name} would both be written to {plan.path}; "
+                    "include {stem} in the output file name"
+                )
+            owners[key] = path
 
 
 @dataclass
@@ -636,6 +672,24 @@ class ExportResult:
     @property
     def rows(self) -> int:
         return sum(rows for _, rows in self.outputs)
+
+
+def _write_stdout(text: str, stream: Any = None) -> None:
+    """Write CSV text to *stream*, or to stdout as UTF-8 bytes.
+
+    Writing bytes avoids the platform newline translation (``\\r\\r\\n`` on
+    Windows) and the console encoding of text-mode stdout.
+    """
+    if stream is not None:
+        stream.write(text)
+        return
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is None:
+        sys.stdout.write(text)
+        return
+    sys.stdout.flush()
+    buffer.write(text.encode("utf-8"))
+    buffer.flush()
 
 
 def _count_lines(path: Path) -> int:
@@ -669,7 +723,7 @@ def export_file(
         if plan.path is None:
             df = query.collect()
             text = df.write_csv(**csv_write_options(cfg))
-            (stream or sys.stdout).write(text)
+            _write_stdout(text, stream)
             result.outputs.append((None, df.height))
             continue
         if plan.path.exists() and not overwrite:
@@ -754,7 +808,13 @@ def batch_export(
     overwrite: bool = True,
     fail_fast: bool = False,
 ) -> Iterator[BatchItem]:
-    """Export every input with the same configuration, yielding per-file results."""
+    """Export every input with the same configuration, yielding per-file results.
+
+    Raises :class:`ProcessingError` before writing anything if two inputs
+    would produce the same output file.
+    """
+    inputs = list(inputs)
+    check_batch_outputs(inputs, cfg, output, base_dir)
     for path in inputs:
         try:
             yield BatchItem(path, export_file(path, cfg, output=output, base_dir=base_dir, overwrite=overwrite))

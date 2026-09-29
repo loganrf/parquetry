@@ -12,12 +12,13 @@ arch="$(dpkg --print-architecture)"
 pkg="$(mktemp -d)"
 trap 'rm -rf "$pkg"' EXIT
 
-install -d "$pkg/DEBIAN" "$pkg/opt/parquetry" "$pkg/usr/bin" \
+install -d "$pkg/DEBIAN" "$pkg/opt/parquetry" "$pkg/usr/bin" "$pkg/usr/share/mime/packages" \
   "$pkg/usr/share/applications" "$pkg/usr/share/icons/hicolor/scalable/apps"
 cp -a "$bundle/." "$pkg/opt/parquetry/"
 ln -s /opt/parquetry/parquetry "$pkg/usr/bin/parquetry"
 ln -s /opt/parquetry/parquetry-gui "$pkg/usr/bin/parquetry-gui"
 install -m 644 "$here/parquetry.desktop" "$pkg/usr/share/applications/parquetry.desktop"
+install -m 644 "$here/parquetry-mime.xml" "$pkg/usr/share/mime/packages/parquetry.xml"
 install -m 644 "$root_dir/src/parquetry/ui/icon.svg" "$pkg/usr/share/icons/hicolor/scalable/apps/parquetry.svg"
 
 installed_size="$(du -sk "$pkg" | cut -f1)"

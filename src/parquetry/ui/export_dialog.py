@@ -57,14 +57,26 @@ from . import workers
 SEPARATORS = [("Comma  ,", ","), ("Semicolon  ;", ";"), ("Tab", "\t"), ("Pipe  |", "|"), ("Space", " "), ("Other…", None)]
 
 
+def _escape(text: str) -> str:
+    """Protect literal braces from template formatting."""
+    return text.replace("{", "{{").replace("}", "}}")
+
+
 def path_to_template(path: Path, input_path: Path) -> str:
-    """Generalise a concrete output path into a template for other inputs."""
-    name = path.name
-    if input_path.stem and input_path.stem in name:
-        name = name.replace(input_path.stem, "{stem}", 1)
+    """Generalise a concrete output path into a template for other inputs.
+
+    A file name that starts with the input's name (``flight_export.csv`` for
+    ``flight.parquet``) becomes ``{stem}_export.csv``; everything else is kept
+    literally.
+    """
+    name, stem = path.name, input_path.stem
+    if stem and name.startswith(stem):
+        name = "{stem}" + _escape(name[len(stem):])
+    else:
+        name = _escape(name)
     if path.parent.resolve() == input_path.parent.resolve():
         return name
-    return str(path.parent / name)
+    return str(Path(_escape(str(path.parent))) / name)
 
 
 def save_config_interactive(parent: QWidget, settings: QSettings, cfg: ProcessingConfig, info: DatasetInfo | None) -> Path | None:
@@ -512,6 +524,11 @@ class ExportDialog(QDialog):
         if box.clickedButton() is open_folder and result.outputs:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(result.outputs[0][0].parent)))
         self.accept()
+
+    def reject(self) -> None:  # Escape / window close
+        if self._running:
+            return  # the export keeps writing; wait for it to finish
+        super().reject()
 
     def _export_failed(self, exc: BaseException) -> None:
         self._set_running(False)

@@ -108,6 +108,12 @@ def test_sample(tmp_path, capsys):
                          aggregation=AggregationConfig(method="every_nth", n=3)),
         ProcessingConfig(x="d", y=["a"], aggregation=AggregationConfig(method="target_points", points=99, functions=["std"]),
                          csv=CsvOptions(separator=";", decimal_comma=True)),
+        # values argparse would otherwise mistake for options
+        ProcessingConfig(
+            x="-x", y=["-a", "b"], range_mode="relative",
+            ranges=[TimeRange("-5m", "10m", "-warmup"), TimeRange(-5e-06, 0.5)],
+            csv=CsvOptions(separator="-", null_value="-nan", rename={"-a": "-b"}),
+        ),
     ],
 )
 def test_config_to_args_round_trip(cfg):
@@ -139,3 +145,19 @@ def test_generated_command_writes_next_to_input(telemetry, tmp_path, monkeypatch
     assert main(shlex.split(cmd)[1:]) == 0
     assert sorted(p.name for p in telemetry.parent.glob("*.csv")) == ["telemetry_part_a.csv", "telemetry_part_b.csv"]
     assert not list(elsewhere.iterdir())
+
+
+def test_export_refuses_colliding_outputs(telemetry, tmp_path, capsys):
+    copy = tmp_path / "copy.parquet"
+    copy.write_bytes(telemetry.read_bytes())
+    cfg_path = ProcessingConfig(x="time", y=["speed"], output=OutputOptions(path="export.csv")).save(tmp_path / "c.json")
+    assert main(["export", str(telemetry), str(copy), "--config", str(cfg_path)]) == 2
+    assert "would both be written" in capsys.readouterr().err
+    assert not list(tmp_path.glob("*.csv"))
+
+
+def test_stdout_is_written_as_utf8_bytes(telemetry, capsysbinary):
+    assert main(["export", str(telemetry), "--y", "speed", "--range", "-", "2024-01-01T00:00:00", "-o", "-",
+                 "--crlf", "--bom", "--rename", "speed=Geschwindigkeit µ"]) == 0
+    out = capsysbinary.readouterr().out
+    assert out == "\ufefftime,Geschwindigkeit µ\r\n2024-01-01T00:00:00.000000,0.0\r\n".encode()

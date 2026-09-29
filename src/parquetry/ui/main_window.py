@@ -37,6 +37,7 @@ class MainWindow(QMainWindow):
         self.settings = settings or QSettings()
         self.setWindowTitle("Parquetry")
         self.setAcceptDrops(True)
+        self._open_generation = 0
 
         self.browser = FileBrowserPage(self.settings)
         self.explorer = ExplorerPage(self.settings)
@@ -155,13 +156,19 @@ class MainWindow(QMainWindow):
         """Inspect *path* in the background and show it in the explorer."""
         path = Path(path).expanduser()
         self._set_busy(True, f"Opening {path.name}…")
+        self._open_generation += 1
+        generation = self._open_generation  # only the most recent request is shown
 
         def job():
             info = inspect_parquet(path)
             cfg = ProcessingConfig.load(config_path) if config_path else None
             return info, cfg
 
-        workers.submit(job, self._file_opened, lambda exc: self._open_failed(path, exc))
+        workers.submit(
+            job,
+            lambda result: generation == self._open_generation and self._file_opened(result),
+            lambda exc: generation == self._open_generation and self._open_failed(path, exc),
+        )
 
     def _file_opened(self, result: tuple[DatasetInfo, ProcessingConfig | None]) -> None:
         info, cfg = result

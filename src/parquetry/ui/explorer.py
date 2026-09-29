@@ -225,6 +225,7 @@ class ExplorerPage(QWidget):
     def set_dataset(self, info: DatasetInfo, cfg: ProcessingConfig | None = None) -> list[str]:
         """Show *info*; optionally apply a configuration. Returns warnings."""
         self.info = info
+        self._pending = None
         self._overview = None
         self._loaded_x = None
         self.plot.clear()
@@ -283,6 +284,7 @@ class ExplorerPage(QWidget):
             if self.plot.ranges():
                 self.status.emit("Ranges cleared because the x axis changed")
             self.plot.clear_ranges()
+            self._pending = None
             # The old data is in different x units; don't let ranges be drawn on it.
             self._overview = self.plot_data = None
             self.plot.set_data(None, keep_view=False, message="Loading…")
@@ -298,6 +300,10 @@ class ExplorerPage(QWidget):
         cfg.aggregation = self.aggregation.config()
         cfg.range_mode = self.ranges_panel.mode()
         cfg.ranges = self.config_ranges(cfg.range_mode)
+        if self._pending is not None and not cfg.ranges:
+            # A configuration was applied but its ranges are not on the plot yet.
+            cfg.ranges = [TimeRange(r.start, r.end, r.label) for r in self._pending.ranges]
+            cfg.range_mode = self._pending.range_mode
         if self.info is not None:
             cfg.source = str(self.info.path)
         return cfg
@@ -353,20 +359,23 @@ class ExplorerPage(QWidget):
         cfg.ranges = []
         self._generation += 1
         generation = self._generation
+        # Configured ranges stay pending until a load that resolved them is shown;
+        # a superseded load must not drop them.
         pending = self._pending
-        self._pending = None
         self.busy.emit(True, "Loading plot data…")
         info = self.info
         workers.submit(
             lambda: _plot_job(info, cfg, pending),
-            on_done=lambda result: self._plot_loaded(generation, cfg, result),
+            on_done=lambda result: self._plot_loaded(generation, cfg, result, pending),
             on_error=lambda exc: self._plot_failed(generation, exc),
         )
 
-    def _plot_loaded(self, generation: int, cfg: ProcessingConfig, result) -> None:
+    def _plot_loaded(self, generation: int, cfg: ProcessingConfig, result, pending=None) -> None:
         if generation != self._generation:
             return
         data, spans = result
+        if pending is not None and pending is self._pending:
+            self._pending = None
         self.busy.emit(False, "")
         x_changed = self._loaded_x != cfg.x
         self._loaded_x = cfg.x

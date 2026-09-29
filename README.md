@@ -150,16 +150,19 @@ parquetry export flight.parquet --y altitude_m --n 100 --dry-run --save-config e
 
 | Group | Options |
 |---|---|
-| Data | `--x COL`, `--y COL...`, `--range START END [LABEL]` (repeatable, `-` for an open end), `--range-mode absolute\|relative`, `--all-data`, `--split-ranges`, `--no-sort` |
+| Data | `--x COL`, `--y COL...`, `--range START END [LABEL]` (repeatable, `-` for an open end; write `--range=-5m,10m` when a value starts with `-`), `--range-mode absolute\|relative`, `--all-data`, `--split-ranges`, `--no-sort` |
 | Aggregation | `--agg none\|every_nth\|interval\|target_points`, `--n N`, `--every 10s\|1m\|<number>`, `--points N`, `--func mean min max median first last sum count std` |
 | CSV | `--sep`, `--time-format iso\|custom\|epoch_s\|epoch_ms\|elapsed_s`, `--datetime-format`, `--float-precision`, `--decimal-comma`, `--null-value`, `--quote-style`, `--no-header`, `--bom`, `--crlf`, `--rename OLD=NEW` |
 | Run | `-o PATH\|DIR\|-`, `-r`, `--save-config PATH`, `--dry-run`, `--skip-existing`, `--fail-fast`, `-q` |
 
 Output paths may use the placeholders `{stem}`, `{name}`, `{parent}` (folder
-name), `{dir}` (folder path) and `{range}` (the range label or number). A relative path from a configuration file is
-resolved next to each input file. A path given with `-o` is resolved against the
-current directory. The exit code is `0` on success, `1` if any file failed and
-`2` for invalid options, so the command fits into scripts and schedulers.
+name), `{dir}` (folder path) and `{range}` (the range label or number). Write
+literal braces as `{{` and `}}`. A relative path from a configuration file is
+resolved next to each input file. A path given with `-o` is resolved against
+the current directory. If two inputs would be written to the same file, the
+batch is refused before anything is written. The exit code is `0` on success,
+`1` if any file failed and `2` for invalid options, so the command fits into
+scripts and schedulers.
 
 ## Configuration files
 
@@ -195,8 +198,11 @@ Configurations are plain JSON. Every section except `x` and `y` is optional:
 ```
 
 - **Ranges:** absolute ranges use ISO 8601 times (or numbers for a numeric x).
-  Relative ranges are offsets from the first x value. For time columns they are
-  seconds or durations like `"90s"` or `"1h30m"`. `null` leaves an end open.
+  Times without a UTC offset are in the x column's time zone. (The app's range
+  table shows and edits time-zone-aware columns in UTC, and saved configs
+  include the offset.) Relative ranges are offsets from the first x value. For
+  time columns they are seconds or durations like `"90s"` or `"1h30m"`. `null`
+  leaves an end open.
 - **Aggregation methods:** `none`, `every_nth` (`n`), `interval` (`every`: a
   duration for time axes or a bucket width for numeric axes; buckets are aligned
   to calendar/epoch boundaries) and `target_points` (`points` equal-width

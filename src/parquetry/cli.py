@@ -104,7 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sel = exp.add_argument_group("data selection")
     sel.add_argument("--x", help=f"x axis column ({ROW_INDEX} for the row number)")
-    sel.add_argument("--y", nargs="+", metavar="COL", help="y parameter columns")
+    sel.add_argument("--y", nargs="+", action="extend", metavar="COL", help="y parameter columns")
     sel.add_argument(
         "--range",
         nargs="+",
@@ -112,7 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="START END [LABEL]",
         dest="ranges",
         help="keep only this x range (repeatable). Use - for an open end; the optional label names "
-        "the file with --split-ranges",
+        "the file with --split-ranges. Values starting with '-' can be given as --range=START,END[,LABEL]",
     )
     sel.add_argument("--range-mode", choices=("absolute", "relative"), help="interpret ranges as absolute values or offsets from the first x value")
     sel.add_argument("--all-data", action="store_true", help="ignore ranges from the configuration")
@@ -124,7 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
     agg.add_argument("--every", help="interval bucket width: duration (10s, 1m, 1h) or number for numeric x")
     agg.add_argument("--n", type=int, help="keep every Nth row (every_nth)")
     agg.add_argument("--points", type=int, help="number of buckets (target_points)")
-    agg.add_argument("--func", nargs="+", choices=AGG_FUNCTIONS, metavar="FUNC", help=f"aggregation functions: {', '.join(AGG_FUNCTIONS)}")
+    agg.add_argument("--func", nargs="+", action="extend", choices=AGG_FUNCTIONS, metavar="FUNC", help=f"aggregation functions: {', '.join(AGG_FUNCTIONS)}")
 
     fmt = exp.add_argument_group("CSV format")
     fmt.add_argument("--sep", "--separator", type=_separator, dest="separator", help="field separator (default ,)")
@@ -324,10 +324,14 @@ def config_from_args(args: argparse.Namespace) -> ProcessingConfig:
     if args.all_data:
         cfg.ranges = []
     if args.ranges:
+        ranges = []
         for values in args.ranges:
+            if len(values) == 1 and "," in values[0]:  # --range=START,END[,LABEL]
+                values = values[0].split(",", 2)
             if len(values) not in (2, 3):
                 raise ConfigError(f"--range takes START END [LABEL], got {' '.join(values)!r}")
-        cfg.ranges = [TimeRange.from_value(values) for values in args.ranges]
+            ranges.append(TimeRange.from_value(values))
+        cfg.ranges = ranges
     if args.range_mode:
         cfg.range_mode = args.range_mode
     if args.split_ranges:
@@ -384,9 +388,17 @@ def config_from_args(args: argparse.Namespace) -> ProcessingConfig:
 def config_to_args(cfg: ProcessingConfig) -> list[str]:
     """Command line options equivalent to *cfg* (inverse of :func:`config_from_args`)."""
     default = ProcessingConfig()
-    args = ["--x", cfg.x, "--y", *cfg.y]
+    args = _opt("--x", cfg.x)
+    if any(_dashed(y) for y in cfg.y):
+        args += [f"--y={y}" for y in cfg.y]
+    else:
+        args += ["--y", *cfg.y]
     for rng in cfg.ranges:
-        args += ["--range", _bound_arg(rng.start), _bound_arg(rng.end), *([rng.label] if rng.label else [])]
+        values = [_bound_arg(rng.start), _bound_arg(rng.end), *([rng.label] if rng.label else [])]
+        if any(_dashed(v) and v != "-" for v in values) and "," not in rng.label:
+            args.append("--range=" + ",".join(values))
+        else:
+            args += ["--range", *values]
     if cfg.range_mode != default.range_mode:
         args += ["--range-mode", cfg.range_mode]
     if cfg.output.split_ranges:
@@ -399,24 +411,24 @@ def config_to_args(cfg: ProcessingConfig) -> list[str]:
         if agg.method == "every_nth":
             args += ["--n", str(agg.n)]
         elif agg.method == "interval":
-            args += ["--every", str(agg.every)]
+            args += _opt("--every", _number_arg(agg.every))
         elif agg.method == "target_points":
             args += ["--points", str(agg.points)]
         if agg.is_bucketed:
             args += ["--func", *agg.functions]
     csv, dcsv = cfg.csv, default.csv
     if csv.separator != dcsv.separator:
-        args += ["--sep", {"\t": "tab", " ": "space"}.get(csv.separator, csv.separator)]
+        args += _opt("--sep", {"\t": "tab", " ": "space"}.get(csv.separator, csv.separator))
     if csv.time_format != dcsv.time_format:
         args += ["--time-format", csv.time_format]
     if csv.time_format == "custom":
-        args += ["--datetime-format", csv.datetime_format]
+        args += _opt("--datetime-format", csv.datetime_format)
     if csv.float_precision is not None:
         args += ["--float-precision", str(csv.float_precision)]
     if csv.decimal_comma:
         args.append("--decimal-comma")
     if csv.null_value != dcsv.null_value:
-        args += ["--null-value", csv.null_value]
+        args += _opt("--null-value", csv.null_value)
     if csv.quote_style != dcsv.quote_style:
         args += ["--quote-style", csv.quote_style]
     if not csv.include_header:
@@ -426,12 +438,29 @@ def config_to_args(cfg: ProcessingConfig) -> list[str]:
     if csv.line_terminator == "crlf":
         args.append("--crlf")
     for old, new in csv.rename.items():
-        args += ["--rename", f"{old}={new}"]
+        args += _opt("--rename", f"{old}={new}")
     return args
 
 
+def _dashed(value: str) -> bool:
+    return value.startswith("-")
+
+
+def _opt(name: str, value: str) -> list[str]:
+    """``[name, value]``, or ``[name=value]`` when argparse would take the value for an option."""
+    return [f"{name}={value}"] if _dashed(value) else [name, value]
+
+
+def _number_arg(value) -> str:
+    if isinstance(value, float):
+        import numpy as np
+
+        return np.format_float_positional(value, trim="-")  # never exponent notation
+    return str(value)
+
+
 def _bound_arg(value) -> str:
-    return "-" if value is None else str(value)
+    return "-" if value is None else _number_arg(value)
 
 
 def command_line(inputs: Sequence[str], cfg: ProcessingConfig | None = None, config_path: str | None = None,
@@ -476,7 +505,15 @@ def _output_template(output: str | None, cfg: ProcessingConfig, multiple: bool) 
 
 
 def _cmd_export(args: argparse.Namespace) -> int:
-    from .processing import ProcessingError, batch_export, estimate_rows, find_inputs, plan_outputs, resolve_ranges
+    from .processing import (
+        ProcessingError,
+        batch_export,
+        check_batch_outputs,
+        estimate_rows,
+        find_inputs,
+        plan_outputs,
+        resolve_ranges,
+    )
 
     cfg = config_from_args(args)
     inputs = find_inputs(args.inputs, recursive=args.recursive)
@@ -503,6 +540,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
     template = _output_template(args.output, cfg, len(inputs) > 1)
     base_dir = Path.cwd() if args.output else None
     log = (lambda *a: None) if args.quiet else (lambda *a: print(*a, file=sys.stderr))
+    check_batch_outputs(inputs, cfg, template, base_dir)
 
     if args.dry_run:
         failures = 0

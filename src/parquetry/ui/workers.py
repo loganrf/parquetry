@@ -72,9 +72,13 @@ class _Runner(QRunnable):
             else:
                 result = task._fn()
         except BaseException as exc:  # noqa: BLE001 - reported to the UI
-            task.failed.emit(exc)
+            signal, value = "failed", exc
         else:
-            task.done.emit(result)
+            signal, value = "done", result
+        try:
+            getattr(task, signal).emit(value)
+        except RuntimeError:
+            pass  # the application shut down (and deleted the task) while it ran
 
 
 def submit(
