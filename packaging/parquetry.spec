@@ -8,7 +8,13 @@
 # On macOS the folder is additionally wrapped into Parquetry.app.
 #
 # Build with:  pyinstaller packaging/parquetry.spec --noconfirm
+#
+# macOS signing: set MACOS_CODESIGN_IDENTITY to a "Developer ID Application"
+# identity (its name or SHA-1 hash) to sign every binary with the hardened
+# runtime, as notarization requires. Without it the bundle is signed ad hoc.
+# See docs/macos-notarization.md.
 
+import os
 import re
 import subprocess
 import sys
@@ -18,6 +24,14 @@ from PyInstaller.utils.hooks import collect_submodules
 
 ROOT = Path(SPECPATH).parent
 VERSION = re.search(r'__version__ = "([^"]+)"', (ROOT / "src/parquetry/__init__.py").read_text()).group(1)
+
+CODESIGN_IDENTITY = os.environ.get("MACOS_CODESIGN_IDENTITY") or None
+ENTITLEMENTS = str(ROOT / "packaging" / "macos" / "entitlements.plist") if CODESIGN_IDENTITY else None
+if CODESIGN_IDENTITY:
+    # By default PyInstaller only warns when it cannot sign the .app; fail
+    # instead, and verify the finished bundle's signature.
+    os.environ["PYINSTALLER_STRICT_BUNDLE_CODESIGN_ERROR"] = "1"
+    os.environ["PYINSTALLER_VERIFY_BUNDLE_SIGNATURE"] = "1"
 
 # The icon is rendered from the SVG at build time; PyInstaller converts the PNG
 # to .ico/.icns when Pillow is installed.
@@ -64,6 +78,8 @@ cli_exe = EXE(
     console=True,
     upx=False,
     icon=str(ICON) if ICON else None,
+    codesign_identity=CODESIGN_IDENTITY,
+    entitlements_file=ENTITLEMENTS,
 )
 gui_exe = EXE(
     PYZ(gui.pure),
@@ -74,6 +90,8 @@ gui_exe = EXE(
     console=False,
     upx=False,
     icon=str(ICON) if ICON else None,
+    codesign_identity=CODESIGN_IDENTITY,
+    entitlements_file=ENTITLEMENTS,
 )
 
 coll = COLLECT(
