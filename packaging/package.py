@@ -4,7 +4,8 @@ Usage: python packaging/package.py [DIST_DIR] [OUT_DIR]
 
 * Linux:   parquetry-<version>-linux-<arch>.tar.gz and parquetry_<version>_<debarch>.deb
 * Windows: parquetry-<version>-windows-<arch>.zip
-* macOS:   parquetry-<version>-macos-<arch>.dmg (drag Parquetry.app to Applications)
+* macOS:   parquetry-<version>-macos-<arch>.dmg (drag Parquetry.app to Applications),
+           signed when MACOS_CODESIGN_IDENTITY is set
 """
 
 from __future__ import annotations
@@ -59,6 +60,9 @@ def package_macos(dist: Path, out: Path, ver: str) -> list[Path]:
              "-fs", "HFS+", "-format", "UDZO", "-ov", str(dmg)],
             check=True,
         )
+    # Sign the disk image with the same Developer ID as the app before it is notarized.
+    if identity := os.environ.get("MACOS_CODESIGN_IDENTITY"):
+        subprocess.run(["codesign", "--sign", identity, "--timestamp", str(dmg)], check=True)
     return [dmg]
 
 

@@ -4,6 +4,10 @@ name: Release
 # build standalone bundles for Linux, Windows and macOS plus the Python wheel
 # and sdist, and publish them as a GitHub release. Run the workflow manually to
 # build the artifacts without publishing a release.
+#
+# The macOS builds are signed with a Developer ID certificate and notarized by
+# Apple when the signing secrets are set (see docs/macos-notarization.md).
+# Tagged releases fail without them; manual runs then build unsigned bundles.
 on:
   push:
     tags: ["v*"]
@@ -45,7 +49,8 @@ jobs:
   bundle:
     name: bundle (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # Apple's notary service usually takes a few minutes per upload, sometimes longer.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -62,7 +67,15 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      MACOS_SIGNING: ${{ secrets.MACOS_CERTIFICATE_P12 != '' }}
     steps:
+      - name: Require signing for macOS releases
+        if: runner.os == 'macOS' && env.MACOS_SIGNING != 'true' && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          echo "::error::The MACOS_CERTIFICATE_P12 secret is not set, so the release cannot be signed and notarized. See docs/macos-notarization.md."
+          exit 1
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -80,25 +93,92 @@ jobs:
             libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
             libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
 
+      - name: Import signing certificate and notary key (macOS)
+        if: runner.os == 'macOS' && env.MACOS_SIGNING == 'true'
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+        run: |
+          for name in MACOS_CERTIFICATE_PASSWORD APPLE_API_KEY_P8 APPLE_API_KEY_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::The $name secret is not set. See docs/macos-notarization.md."
+              exit 1
+            fi
+          done
+
+          # A temporary keychain that codesign can use without a password prompt
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password=$(openssl rand -base64 24)
+          security create-keychain -p "$keychain_password" "$keychain"
+          echo "MACOS_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          echo "$MACOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain"
+
+          # Sign with the certificate's SHA-1 hash so the name does not matter
+          identity=$(security find-identity -v -p codesigning "$keychain" | awk '/"Developer ID Application: / && !found { print $2; found = 1 }')
+          if [ -z "$identity" ]; then
+            security find-identity -v -p codesigning "$keychain"
+            echo "::error::MACOS_CERTIFICATE_P12 does not contain a Developer ID Application certificate with its private key."
+            exit 1
+          fi
+          echo "MACOS_CODESIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+
+          printf '%s\n' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/notary_key.p8"
+          if ! grep -q "BEGIN PRIVATE KEY" "$RUNNER_TEMP/notary_key.p8"; then
+            echo "::error::APPLE_API_KEY_P8 must contain the text of the AuthKey_<id>.p8 file."
+            exit 1
+          fi
+          echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/notary_key.p8" >> "$GITHUB_ENV"
+
       - name: Install
         run: |
           python -m pip install --upgrade pip
           python -m pip install ".[package]"
 
+      # Signs the macOS bundle when MACOS_CODESIGN_IDENTITY is set
       - name: Build bundle
         run: pyinstaller packaging/parquetry.spec --noconfirm
 
       - name: Smoke test
         run: python packaging/smoke_test.py dist
 
+      # Staples the ticket to the app itself, so it also opens offline after
+      # being copied out of the disk image.
+      - name: Notarize app (macOS)
+        if: runner.os == 'macOS' && env.MACOS_SIGNING == 'true'
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: python packaging/macos/notarize.py dist/Parquetry.app
+
       - name: Package
         run: python packaging/package.py dist artifacts
+
+      - name: Notarize disk image (macOS)
+        if: runner.os == 'macOS' && env.MACOS_SIGNING == 'true'
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: python packaging/macos/notarize.py artifacts/*.dmg
 
       - uses: actions/upload-artifact@v4
         with:
           name: bundle-${{ matrix.name }}
           path: artifacts/*
           if-no-files-found: error
+
+      - name: Remove signing keychain and notary key (macOS)
+        if: always() && env.MACOS_KEYCHAIN != ''
+        run: |
+          security delete-keychain "$MACOS_KEYCHAIN"
+          rm -f "$APPLE_API_KEY_PATH"
 
   publish:
     name: publish GitHub release

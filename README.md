@@ -41,14 +41,16 @@ self-contained builds that do not need Python:
 | Ubuntu / Debian (x86-64) | `parquetry_<version>_amd64.deb` | `sudo apt install ./parquetry_<version>_amd64.deb`, then `parquetry` / `parquetry-gui` |
 | Linux (x86-64) | `parquetry-<version>-linux-x86_64.tar.gz` | Extract and run `parquetry/parquetry-gui` |
 
-`SHA256SUMS.txt` lists checksums for all files. The builds are not code-signed:
+`SHA256SUMS.txt` lists checksums for all files.
 
-- **macOS:** the first time, right-click the app and choose *Open*. If macOS says
-  the app is damaged, run `xattr -dr com.apple.quarantine /Applications/Parquetry.app`.
+- **macOS:** the app is signed and notarized by Apple, so it opens normally.
+  v0.1.0 was not signed: for it, right-click the app and choose *Open* the first
+  time, or run `xattr -dr com.apple.quarantine /Applications/Parquetry.app` if
+  macOS says the app is damaged.
   The command line tool is at `/Applications/Parquetry.app/Contents/MacOS/parquetry`;
   you can add it to your `PATH` with a symlink.
-- **Windows:** SmartScreen may warn about an unknown publisher. Choose
-  *More info → Run anyway*.
+- **Windows:** the build is not code-signed, so SmartScreen may warn about an
+  unknown publisher. Choose *More info → Run anyway*.
 - **Linux (tar.gz):** Qt needs the usual desktop libraries (`libegl1`,
   `libxkbcommon-x11-0`, `libxcb-cursor0`, …). The `.deb` installs them as
   dependencies.
@@ -245,6 +247,12 @@ each bundle (the CLI end to end and the UI headless), packages them with
 `packaging/package.py`, and publishes everything with checksums as a GitHub
 release. Tags with a hyphen (`v0.2.0-rc1`) become pre-releases. Starting the
 workflow manually builds all artifacts without publishing.
+
+The macOS app and disk images are signed with a Developer ID certificate and
+notarized by Apple. This needs a one-time setup with an Apple Developer account
+and five repository secrets, described in
+[docs/macos-notarization.md](docs/macos-notarization.md). Tagged releases fail
+until the secrets are set.
 
 To build a bundle locally on the current platform:
 
