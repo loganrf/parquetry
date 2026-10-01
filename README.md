@@ -1,5 +1,8 @@
 # Parquetry
 
+** Yes, this is AI slop! User beware! **
+
+
 Explore, compact and export large Parquet and CSV files. Parquetry is a desktop
 app for browsing time series (or any tabular) data stored in Parquet or CSV, plus
 a command line tool that replays what you set up in the app on any number of
