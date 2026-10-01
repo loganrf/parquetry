@@ -1,11 +1,11 @@
 [Desktop Entry]
 Type=Application
 Name=Parquetry
-GenericName=Parquet Explorer
-Comment=Explore, aggregate and export Parquet files
+GenericName=Parquet and CSV Explorer
+Comment=Explore, aggregate and export Parquet and CSV files
 Exec=parquetry-gui %f
 Icon=parquetry
 Terminal=false
 Categories=Science;DataVisualization;Office;
-MimeType=application/vnd.apache.parquet;application/x-parquet;
+MimeType=application/vnd.apache.parquet;application/x-parquet;text/csv;text/tab-separated-values;
 Keywords=parquet;csv;telemetry;plot;polars;

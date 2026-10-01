@@ -2,7 +2,7 @@
 
 Usage: python packaging/smoke_test.py [DIST_DIR]
 
-Runs the bundled CLI (version, sample data, info, export) and starts the UI
+Runs the bundled CLI (version, sample data, info, export, CSV input) and starts the UI
 headless for a few seconds with both executables. On macOS it also checks the
 app's Info.plist.
 """
@@ -76,6 +76,10 @@ def main() -> None:
             rows = list(csv.reader(fh))
         assert rows[0] == ["timestamp", "altitude_m_mean", "altitude_m_max", "engine_rpm_mean", "engine_rpm_max"], rows[0]
         assert len(rows) == 8, len(rows)  # header + 7 buckets covering 0-60 s
+        assert "CSV (comma separated)" in run(cli, "info", "out.csv", cwd=work)
+        run(cli, "export", "out.csv", "--y", "altitude_m_max", "--n", "2", "-o", "again.csv", cwd=work)
+        with open(work / "again.csv", newline="") as fh:
+            assert len(list(csv.reader(fh))) == 5  # header + every second of 7 rows
         run(cli, "ui", "sample.parquet", "--quit-after", "3", cwd=work)
         run(gui, "--quit-after", "3", cwd=work)
     print("smoke test passed")

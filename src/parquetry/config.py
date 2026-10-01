@@ -1,7 +1,7 @@
 """Processing configuration shared by the UI and the command line.
 
-A :class:`ProcessingConfig` captures everything needed to turn a Parquet file
-into CSV: the x column, the y parameters, the ranges to keep, how to aggregate
+A :class:`ProcessingConfig` captures everything needed to turn a Parquet or
+CSV file into CSV: the x column, the y parameters, the ranges to keep, how to aggregate
 and how the CSV should be formatted. It round-trips through JSON so that a
 configuration built interactively can be re-applied to similar files with
 ``parquetry export --config``.
@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from collections.abc import Collection
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,7 @@ from .durations import is_duration
 
 CONFIG_VERSION = 1
 
-AGG_METHODS = ("none", "every_nth", "interval", "target_points")
+AGG_METHODS = ("none", "every_nth", "interval", "target_points", "per_value")
 AGG_METHOD_ALIASES = {
     "raw": "none",
     "nth": "every_nth",
@@ -28,14 +29,19 @@ AGG_METHOD_ALIASES = {
     "bucket": "interval",
     "points": "target_points",
     "auto": "target_points",
+    "group": "per_value",
+    "category": "per_value",
 }
 AGG_METHOD_LABELS = {
     "none": "None (all rows)",
     "every_nth": "Every Nth row",
     "interval": "Fixed interval buckets",
     "target_points": "Target number of points",
+    "per_value": "One bucket per x value",
 }
 AGG_FUNCTIONS = ("mean", "min", "max", "median", "first", "last", "sum", "count", "std")
+#: Aggregation functions that also apply to text columns.
+TEXT_FUNCTIONS = ("first", "last", "count", "min", "max")
 
 RANGE_MODES = ("absolute", "relative")
 TIME_FORMATS = ("iso", "custom", "epoch_s", "epoch_ms", "elapsed_s")
@@ -122,6 +128,8 @@ class AggregationConfig:
     every: str | float = "1s"
     #: target_points: number of equal-width buckets spanning the data.
     points: int = 2000
+    #: Functions applied per bucket (interval, target_points and per_value, which
+    #: makes every distinct x value - or text category - its own bucket).
     functions: list[str] = field(default_factory=lambda: ["mean"])
 
     def __post_init__(self) -> None:
@@ -148,7 +156,7 @@ class AggregationConfig:
                     raise ConfigError(
                         f"aggregation.every {self.every!r} is neither a duration (e.g. '1m') nor a number"
                     ) from None
-        if self.method in {"interval", "target_points"}:
+        if self.is_bucketed:
             if not self.functions:
                 raise ConfigError("Select at least one aggregation function")
             bad = [f for f in self.functions if f not in AGG_FUNCTIONS]
@@ -157,7 +165,7 @@ class AggregationConfig:
 
     @property
     def is_bucketed(self) -> bool:
-        return self.method in {"interval", "target_points"}
+        return self.method in {"interval", "target_points", "per_value"}
 
     def describe(self) -> str:
         if self.method == "none":
@@ -167,6 +175,8 @@ class AggregationConfig:
         funcs = ", ".join(self.functions)
         if self.method == "interval":
             return f"{funcs} per {self.every} bucket"
+        if self.method == "per_value":
+            return f"{funcs} per x value"
         return f"{funcs} over {self.points:,} buckets"
 
     def to_dict(self) -> dict[str, Any]:
@@ -285,16 +295,28 @@ class ProcessingConfig:
         clone = ProcessingConfig.from_dict(self.to_dict())
         return replace(clone, **changes) if changes else clone
 
-    def output_columns(self) -> list[tuple[str, str, str | None]]:
-        """``(output name, source column, function)`` for every value column."""
+    def output_columns(self, text: Collection[str] = ()) -> list[tuple[str, str, str | None]]:
+        """``(output name, source column, function)`` for every value column.
+
+        *text* names the y columns that hold text. Only :data:`TEXT_FUNCTIONS`
+        apply to them; when none of the configured functions does, the first
+        value of each bucket is used.
+        """
         ys = [c for c in dict.fromkeys(self.y) if c != self.x]
         agg = self.aggregation
         if not agg.is_bucketed:
             return [(c, c, None) for c in ys]
         funcs = list(dict.fromkeys(agg.functions))
-        if len(funcs) == 1:
-            return [(c, c, funcs[0]) for c in ys]
-        return [(f"{c}_{fn}", c, fn) for c in ys for fn in funcs]
+        out = []
+        for c in ys:
+            own = funcs
+            if c in text:
+                own = [fn for fn in funcs if fn in TEXT_FUNCTIONS] or ["first"]
+            if len(funcs) == 1:
+                out.append((c, c, own[0]))
+            else:
+                out += [(f"{c}_{fn}", c, fn) for fn in own]
+        return out
 
     # -- serialisation -------------------------------------------------------------
     def to_dict(self) -> dict[str, Any]:

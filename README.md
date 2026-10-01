@@ -1,22 +1,31 @@
 # Parquetry
 
-Explore, compact and export large Parquet files. Parquetry is a desktop app for
-browsing time series (or any numeric) data stored in Parquet, plus a command line
-tool that replays what you set up in the app on any number of similar files.
+Explore, compact and export large Parquet and CSV files. Parquetry is a desktop
+app for browsing time series (or any tabular) data stored in Parquet or CSV, plus
+a command line tool that replays what you set up in the app on any number of
+similar files.
 
 ![Explorer with stacked plots, min–max bands and two selected time ranges](docs/explorer.png)
 
 - **File browser on start-up** with a metadata preview (rows, columns, row groups,
-  schema) that reads only the Parquet footer.
-- **Pick an x axis and any number of y parameters.** Timestamps, numbers or the
-  row number work as x; numeric and boolean columns can be plotted.
+  schema) that reads only the Parquet footer, or only the start of a CSV file.
+- **Parquet and CSV input.** The separator (comma, semicolon, tab, pipe), decimal
+  comma and column types of CSV files are detected automatically, dates and times
+  included.
+- **Pick an x axis and any number of y parameters.** Timestamps, numbers, text or
+  the row number work as x; numeric, boolean and text columns can be plotted.
+- **Text data** is drawn as steps on an axis labelled with its values (states,
+  modes, flight phases). A text x axis shows one bar or column of markers per
+  category, in the order the categories appear in the file.
+- **Data table** below the plot with the rows behind the visible part of the plot,
+  text included. Zoom the plot to move through the rows.
 - **Built for large files.** Only the selected columns are read, range filters
   are pushed down into the Parquet scan, and plots of more than a million rows
   are drawn as a min/max envelope, so spikes stay visible. You can load full
   detail for the part you have zoomed into.
 - **Aggregation to compact data:** every Nth row, fixed interval buckets (`500ms`,
-  `1m`, `1h`, …) or a target number of buckets, with mean, min, max, median,
-  first, last, sum, count and std.
+  `1m`, `1h`, …), a target number of buckets or one bucket per x value (per
+  category), with mean, min, max, median, first, last, sum, count and std.
 - **Interactive plot:** stacked or overlaid, optional point markers, crosshair
   readout, scroll to zoom, and drag to select time ranges.
 - **CSV export:** separator, time format (ISO, custom strftime, epoch, elapsed
@@ -73,35 +82,44 @@ From a checkout: `pip install -e ".[ui,test]"`.
 
 ```bash
 parquetry sample flight.parquet --rows 2000000   # synthetic telemetry to play with
+parquetry sample flight.csv --rows 100000        # the same as CSV
 parquetry                                        # open the app with the file browser
 parquetry flight.parquet                         # or open a file directly
 ```
 
 ## Using the app
 
-1. **Choose a file.** The start page is a file browser that shows Parquet files
-   only (tick *Show all files* to see everything). Selecting a file shows its size,
-   row count and schema; double-click or press *Open* to explore it. You can also
-   drop a file onto the window or use *File → Open recent*.
+1. **Choose a file.** The start page is a file browser that shows Parquet and
+   CSV files (tick *Show all files* to see everything; other text files open as
+   CSV). Selecting a file shows its format, size, row count and schema;
+   double-click or press *Open* to explore it. You can also drop a file onto the
+   window or use *File → Open recent*.
 2. **Choose parameters.** Pick the **X axis** (a timestamp column is chosen
    automatically) and tick the **Y parameters**. The filter box helps when a file
-   has hundreds of columns. Double-click a parameter to show only that one.
+   has hundreds of columns, and *Sort* (or a click on a column header) orders the
+   list by name or type; *File order* restores the file's column order. Plots and
+   exports show parameters in the order you tick them. Double-click a parameter
+   to show only that one. Text parameters get a plot of their own, also when the
+   others are overlaid.
 3. **Aggregate** (optional). Choose a method and the functions to apply. If you
    choose both *min* and *max*, they are drawn as a shaded band. The plot and
-   exports both use this aggregation.
+   exports both use this aggregation. With a text x axis, *One bucket per x
+   value* aggregates per category, for example the mean revenue per region.
 4. **Explore the plot.** Scroll to zoom and drag to pan. *Auto Y* fits the y axis
    to the visible data, *Stacked* switches between one plot per parameter and a
    single overlay, and *Points* marks every data point, so values surrounded by
    gaps (nulls), which no line can connect, stay visible. The readout under the
    plot shows the values under the cursor. When the plot shows a min/max
    envelope of a large file, zoom in and press **D** to load full detail for
-   that region.
+   that region. The **Data** tab under the plot lists the rows behind the
+   visible part of the plot (the first 50,000) and follows the plot as you zoom
+   and pan. Ctrl+C copies the selected cells.
 5. **Select ranges.** **Shift+drag** on the plot, or turn on **Range mode (R)**
    and drag, or press **Add range (A)**. Ranges can be moved and resized on the
    plot, edited or labelled in the table below it, and removed from the table or
    with a right-click. *Save as* chooses whether a saved configuration stores
    them as absolute times or as offsets from the start of the data. Offsets can
-   be applied to other recordings.
+   be applied to other recordings. Ranges need a numeric or time x axis.
 6. **Export CSV (Ctrl+E).** Choose the output file, all data or only the
    selected ranges (optionally one file per range), whether to use the
    aggregation, column headers and the CSV format. The preview updates as you
@@ -129,13 +147,16 @@ parquetry flight.parquet                         # or open a file directly
 
 ```text
 parquetry [ui] [FILE] [--config CFG]   open the app (the default command)
-parquetry info FILE [--stats] [--json] schema, row count, x range, optional column statistics
+parquetry info FILE [--stats] [--json] format, schema, row count, x range, optional column statistics
 parquetry export INPUT... [options]    filter, aggregate and write CSV
 parquetry sample PATH [--rows N]       write synthetic telemetry data
 ```
 
-`parquetry export` takes files, directories (`-r` to recurse) and glob patterns.
-Options on the command line override values from `--config`:
+`parquetry export` takes Parquet and CSV files, directories (`-r` to recurse) and
+glob patterns. Directories are searched for `.parquet`, `.parq`, `.pq`, `.csv` and
+`.tsv` files, leaving out files that the export itself writes, so repeating an
+export in a folder of CSV files does not export its earlier results. Options on
+the command line override values from `--config`:
 
 ```bash
 # Re-run a configuration saved in the app on a whole folder
@@ -151,12 +172,15 @@ parquetry export runs/ --config cfg.json --range 0 10m warmup --range-mode relat
 
 # Check what would be written, then save the options as a configuration
 parquetry export flight.parquet --y altitude_m --n 100 --dry-run --save-config every100.json
+
+# CSV input with a text x axis: mean and maximum revenue per region
+parquetry export sales.csv --x region --y revenue --agg per_value --func mean max -o -
 ```
 
 | Group | Options |
 |---|---|
 | Data | `--x COL`, `--y COL...`, `--range START END [LABEL]` (repeatable, `-` for an open end), `--range-mode absolute\|relative`, `--all-data`, `--split-ranges`, `--no-sort` |
-| Aggregation | `--agg none\|every_nth\|interval\|target_points`, `--n N`, `--every 10s\|1m\|<number>`, `--points N`, `--func mean min max median first last sum count std` |
+| Aggregation | `--agg none\|every_nth\|interval\|target_points\|per_value`, `--n N`, `--every 10s\|1m\|<number>`, `--points N`, `--func mean min max median first last sum count std` |
 | CSV | `--sep`, `--time-format iso\|custom\|epoch_s\|epoch_ms\|elapsed_s`, `--datetime-format`, `--float-precision`, `--decimal-comma`, `--null-value`, `--quote-style`, `--no-header`, `--bom`, `--crlf`, `--rename OLD=NEW` |
 | Run | `-o PATH\|DIR\|-`, `-r`, `--save-config PATH`, `--dry-run`, `--skip-existing`, `--fail-fast`, `-q` |
 
@@ -204,10 +228,36 @@ Configurations are plain JSON. Every section except `x` and `y` is optional:
   seconds or durations like `"90s"` or `"1h30m"`. `null` leaves an end open.
 - **Aggregation methods:** `none`, `every_nth` (`n`), `interval` (`every`: a
   duration for time axes or a bucket width for numeric axes; buckets are aligned
-  to calendar/epoch boundaries) and `target_points` (`points` equal-width
-  buckets). With several functions, columns are named `<column>_<function>`.
+  to calendar/epoch boundaries), `target_points` (`points` equal-width
+  buckets) and `per_value` (one bucket per distinct x value, the only bucketed
+  method for a text x axis). With several functions, columns are named
+  `<column>_<function>`.
+- **Text parameters** support `first`, `last`, `count`, `min` and `max`; other
+  functions are left out for them, and if none of the configured functions
+  applies, the first value of each bucket is written.
 - **`rename`** maps output column names (after aggregation) to CSV headers.
 - Unknown keys are rejected, so typos surface immediately.
+
+## CSV files and text data
+
+- **Detection.** The separator is guessed from the first lines (`.tsv` files are
+  always tab separated), and a decimal comma is assumed when numbers use one and a
+  separator other than a comma. The first line holds the column names. A UTF-8
+  byte order mark is ignored and invalid UTF-8 is replaced, so files from other
+  encodings still open.
+- **Column types** are inferred from the first 10,000 rows: integers, floats,
+  booleans (`true`/`false`), ISO 8601 dates and times (with time zone offsets) and
+  text. Empty cells and `NA`, `N/A`, `#N/A`, `null` and `NULL` are missing values.
+  When a file is opened, the whole file is then checked: a column whose later
+  values do not fit becomes a float column (`1`, `2`, … `2.5`) or a text column.
+- **Text** can be a y parameter and the x axis. Text values are plotted at the
+  positions of their sorted categories. A text x axis keeps the categories, and
+  the rows, in the order they appear in the file (rows are not sorted by a text x
+  column), and ranges are not available for it. Categorical Parquet columns are
+  treated as text.
+- **Exports** of a CSV file work exactly as for Parquet, and CSV files that
+  Parquetry writes with ISO 8601 times (the default) read back with the same
+  column types.
 
 ## How large files are handled
 
@@ -215,9 +265,13 @@ Parquetry uses [polars](https://pola.rs) lazy queries, so only the columns you
 select are read. Range filters use Parquet statistics to skip row groups, and
 aggregation happens in the query engine. CSV output is streamed to disk and
 written to a temporary file, which is renamed only when the export succeeds.
-The plot never holds more than about a million points per series. Larger
-results are reduced to a min/max envelope for display only, and exports always
-use the full data.
+The plot never holds more than about a million points per series (100,000 with
+a text x axis). Larger results are reduced to a min/max envelope for display
+only, and exports always use the full data.
+
+CSV files have no column statistics and must be parsed for every query, so they
+are slower to work with than Parquet: on a 4-core machine, opening a 220 MB CSV
+file with 3 million rows (which checks every value) takes about 2 s.
 
 On a 20 million row, 876 MB file (4-core machine), reading the metadata takes
 0.07 s, the first plot about 2 s, one-second aggregation 0.6 s, and exporting a 5 minute window
@@ -230,8 +284,9 @@ pip install -e ".[ui,metadata,test]"
 QT_QPA_PLATFORM=offscreen pytest      # the UI tests run headless
 ```
 
-The code is split into a UI-independent core (`dataset.py`, `config.py`,
-`processing.py`, `cli.py`) and the Qt app in `parquetry/ui/`. The app and the
+The code is split into a UI-independent core (`dataset.py` reads Parquet and
+CSV files, `config.py`, `processing.py`, `cli.py`) and the Qt app in
+`parquetry/ui/`. The app and the
 CLI call the same functions, so a saved configuration produces the same output
 in both.
 

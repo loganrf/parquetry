@@ -24,7 +24,7 @@ from .config import (
     ProcessingConfig,
     TimeRange,
 )
-from .dataset import ROW_INDEX, ROW_INDEX_LABEL, format_bytes, inspect_parquet
+from .dataset import ROW_INDEX, ROW_INDEX_LABEL, format_bytes, inspect_file
 from .durations import format_seconds
 
 COMMANDS = ("ui", "info", "export", "sample")
@@ -40,6 +40,13 @@ examples:
 
   # first 10 minutes of every file, relative to each file's start
   parquetry export runs/ --config cfg.json --range 0 10m --range-mode relative
+
+  # CSV input; mean and maximum per category of a text column
+  parquetry export sales.csv --x region --y revenue --agg per_value --func mean max
+
+directories are searched for Parquet (.parquet, .parq, .pq) and CSV (.csv, .tsv)
+files. Files that the export itself writes (e.g. results of an earlier run in
+the same folder) are skipped.
 
 output templates may use {stem}, {name}, {parent} (folder name), {dir} (folder
 path) and {range}. Relative templates from a configuration are resolved next to each input file; a
@@ -73,31 +80,31 @@ def _rename(text: str) -> tuple[str, str]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="parquetry",
-        description="Explore, aggregate and export Parquet files. Run without a command to open the UI.",
+        description="Explore, aggregate and export Parquet and CSV files. Run without a command to open the UI.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
     ui = sub.add_parser("ui", help="open the desktop UI (default)", description="Open the desktop UI.")
-    ui.add_argument("file", nargs="?", help="Parquet file to open directly (skips the file browser)")
+    ui.add_argument("file", nargs="?", help="Parquet or CSV file to open directly (skips the file browser)")
     ui.add_argument("-c", "--config", help="processing configuration to apply after opening the file")
     ui.add_argument("--quit-after", type=float, help=argparse.SUPPRESS)  # seconds; used by packaging smoke tests
 
-    info = sub.add_parser("info", help="show schema and metadata of a Parquet file")
-    info.add_argument("file", help="Parquet file")
+    info = sub.add_parser("info", help="show schema and metadata of a Parquet or CSV file")
+    info.add_argument("file", help="Parquet or CSV file")
     info.add_argument("--x", help="column whose value range is reported (default: auto-detected time column)")
     info.add_argument("--stats", action="store_true", help="compute min/max/mean/null counts (reads all data)")
     info.add_argument("--json", action="store_true", help="machine readable output")
 
     exp = sub.add_parser(
         "export",
-        help="export Parquet data to CSV using a configuration and/or options",
-        description="Filter, aggregate and export Parquet files to CSV. Options given on the command "
-        "line override the values from --config.",
+        help="export Parquet or CSV data to CSV using a configuration and/or options",
+        description="Filter, aggregate and export Parquet and CSV files to CSV. Options given on the "
+        "command line override the values from --config.",
         epilog=EXPORT_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    exp.add_argument("inputs", nargs="+", metavar="INPUT", help="Parquet files, directories or glob patterns")
+    exp.add_argument("inputs", nargs="+", metavar="INPUT", help="Parquet or CSV files, directories or glob patterns")
     exp.add_argument("-c", "--config", help="JSON processing configuration (e.g. saved from the UI)")
     exp.add_argument("-o", "--output", help="output file or template, a directory, or - for stdout")
     exp.add_argument("-r", "--recursive", action="store_true", help="search directories recursively")
@@ -147,7 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("-q", "--quiet", action="store_true", help="only print errors")
 
     smp = sub.add_parser("sample", help="write a synthetic telemetry Parquet file to try things out")
-    smp.add_argument("path", help="output .parquet file")
+    smp.add_argument("path", help="output .parquet file (.csv or .tsv writes CSV)")
     smp.add_argument("--rows", type=int, default=1_000_000, help="number of rows (default 1,000,000)")
     smp.add_argument("--rate", type=float, default=100.0, help="sample rate in Hz (default 100)")
     return parser
@@ -211,7 +218,7 @@ def _cmd_ui(args: argparse.Namespace) -> int:
 def _cmd_info(args: argparse.Namespace) -> int:
     from .processing import data_bounds, to_epoch_us
 
-    info = inspect_parquet(args.file)
+    info = inspect_file(args.file)
     x = args.x or info.guess_x()
     if not info.has_column(x):
         raise ValueError(f"Column {x!r} not found")
@@ -221,6 +228,8 @@ def _cmd_info(args: argparse.Namespace) -> int:
     if args.json:
         payload = {
             "path": str(info.path),
+            "format": info.format,
+            **({"csv": {"separator": info.csv.separator, "decimal_comma": info.csv.decimal_comma}} if info.csv else {}),
             "size_bytes": info.size_bytes,
             "rows": info.num_rows,
             "row_groups": info.num_row_groups,
@@ -238,6 +247,7 @@ def _cmd_info(args: argparse.Namespace) -> int:
 
     rows = [
         ("File", str(info.path)),
+        ("Format", info.format_label),
         ("Size", format_bytes(info.size_bytes)),
         ("Rows", f"{info.num_rows:,}"),
         ("Columns", str(len(info.columns))),
@@ -263,7 +273,10 @@ def _cmd_info(args: argparse.Namespace) -> int:
         headers += ["Nulls", "Min", "Max", "Mean"]
     table = []
     for i, col in enumerate(info.columns):
-        role = {"datetime": "time (x)", "date": "time (x)", "numeric": "numeric", "boolean": "boolean", "duration": "duration"}.get(col.kind, "-")
+        role = {
+            "datetime": "time (x)", "date": "time (x)", "numeric": "numeric", "boolean": "boolean",
+            "duration": "duration", "text": "text",
+        }.get(col.kind, "-")
         line = [str(i), col.name, col.dtype_name, role]
         if stats:
             s = stats.get(col.name, {})
@@ -301,7 +314,7 @@ def _column_stats(info) -> dict[str, dict]:
             exprs.append(pl.col(col.name).null_count().alias(f"{col.name}\0nulls"))
     if not exprs:
         return {}
-    row = pl.scan_parquet(info.path).select(exprs).collect().row(0, named=True)
+    row = info.scan().select(exprs).collect().row(0, named=True)
     stats: dict[str, dict] = {}
     for key, value in row.items():
         name, stat = key.split("\0")
@@ -476,17 +489,33 @@ def _output_template(output: str | None, cfg: ProcessingConfig, multiple: bool) 
 
 
 def _cmd_export(args: argparse.Namespace) -> int:
-    from .processing import ProcessingError, batch_export, estimate_rows, find_inputs, plan_outputs, resolve_ranges
+    from .processing import (
+        ProcessingError,
+        batch_export,
+        estimate_rows,
+        exclude_outputs,
+        find_inputs,
+        plan_outputs,
+        resolve_ranges,
+    )
 
     cfg = config_from_args(args)
     inputs = find_inputs(args.inputs, recursive=args.recursive)
     if not inputs:
-        raise ValueError("No Parquet files found")
+        raise ValueError("No Parquet or CSV files found")
+    template = _output_template(args.output, cfg, len(inputs) > 1)
+    base_dir = Path.cwd() if args.output else None
+    log = (lambda *a: None) if args.quiet else (lambda *a: print(*a, file=sys.stderr))
+    inputs, own_outputs = exclude_outputs(inputs, cfg, template, base_dir)
+    for path in own_outputs:
+        log(f"{path}: skipped (written by this export)")
+    if not inputs:
+        raise ValueError("No input files left after skipping the files this export writes")
 
     missing_x = not cfg.x
     if missing_x or not cfg.y:
         # Fill gaps from the first file so quick ad-hoc exports need few options.
-        first = inspect_parquet(inputs[0])
+        first = inspect_file(inputs[0])
         if missing_x:
             cfg.x = first.guess_x()
         if not cfg.y:
@@ -500,15 +529,11 @@ def _cmd_export(args: argparse.Namespace) -> int:
         if not args.quiet:
             print(f"Saved configuration to {path}", file=sys.stderr)
 
-    template = _output_template(args.output, cfg, len(inputs) > 1)
-    base_dir = Path.cwd() if args.output else None
-    log = (lambda *a: None) if args.quiet else (lambda *a: print(*a, file=sys.stderr))
-
     if args.dry_run:
         failures = 0
         for path in inputs:
             try:
-                info = inspect_parquet(path)
+                info = inspect_file(path)
                 from .processing import validate_for
 
                 validate_for(cfg, info)

@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 from .. import __version__
 from ..cli import build_parser, export_parser
 from ..config import ConfigError, ProcessingConfig
-from ..dataset import DatasetInfo, inspect_parquet
+from ..dataset import DatasetInfo, inspect_file
 from ..processing import ProcessingError
 from . import workers
 from .batch_dialog import BatchDialog
@@ -85,7 +85,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(ex.act_export)
         self.act_batch = QAction("&Batch export…", self)
         self.act_batch.setShortcut(QKeySequence("Ctrl+B"))
-        self.act_batch.setStatusTip("Apply a configuration to many Parquet files")
+        self.act_batch.setStatusTip("Apply a configuration to many Parquet or CSV files")
         self.act_batch.triggered.connect(self.batch_export)
         file_menu.addAction(self.act_batch)
         file_menu.addSeparator()
@@ -147,7 +147,7 @@ class MainWindow(QMainWindow):
         self.explorer.toolbar.setEnabled(True)
         for action in self._file_actions:
             action.setEnabled(True)
-        self.explorer.act_detail.setEnabled(bool(self.explorer.plot_data and self.explorer.plot_data.reduced))
+        self.explorer.update_actions()
         self.setWindowTitle(f"{self.explorer.info.path.name} – Parquetry")
 
     # ------------------------------------------------------------------ files
@@ -157,7 +157,7 @@ class MainWindow(QMainWindow):
         self._set_busy(True, f"Opening {path.name}…")
 
         def job():
-            info = inspect_parquet(path)
+            info = inspect_file(path)
             cfg = ProcessingConfig.load(config_path) if config_path else None
             return info, cfg
 
@@ -264,7 +264,7 @@ class MainWindow(QMainWindow):
             self,
             "About Parquetry",
             f"<h3>Parquetry {__version__}</h3>"
-            "<p>Explore, aggregate and export Parquet files.</p>"
+            "<p>Explore, aggregate and export Parquet and CSV files.</p>"
             "<p>Built on polars, PySide6 and pyqtgraph.</p>",
         )
 

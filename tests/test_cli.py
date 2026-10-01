@@ -7,6 +7,7 @@ import pytest
 
 from parquetry.cli import build_parser, command_line, config_from_args, config_to_args, main
 from parquetry.config import AggregationConfig, CsvOptions, OutputOptions, ProcessingConfig, TimeRange
+from parquetry.dataset import inspect_file
 
 
 def test_info_text(telemetry, capsys):
@@ -22,6 +23,35 @@ def test_info_json_with_stats(telemetry, capsys):
     assert payload["suggested_x"] == "time"
     speed = next(c for c in payload["columns"] if c["name"] == "speed")
     assert speed["stats"]["max"] == 599
+
+
+def test_info_csv(tmp_path, capsys):
+    path = tmp_path / "data.csv"
+    path.write_text("t;v;mode\n2024-01-01 00:00:00;1,5;a\n2024-01-01 00:00:01;2,5;b\n")
+    assert main(["info", str(path)]) == 0
+    out = capsys.readouterr().out
+    assert "CSV (semicolon separated, decimal comma)" in out and "time (x)" in out and "text" in out
+    assert main(["info", str(path), "--json", "--stats"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["format"] == "csv" and payload["csv"] == {"separator": ";", "decimal_comma": True}
+    assert next(c for c in payload["columns"] if c["name"] == "v")["stats"]["max"] == 2.5
+
+
+def test_export_folder_of_csv_files_twice(tmp_path, capsys):
+    for name in ("a", "b"):
+        (tmp_path / f"{name}.csv").write_text("x,y,label\n1,2,p\n3,4,q\n")
+    for _ in range(2):  # the second run must not export the first run's results
+        assert main(["export", str(tmp_path), "--x", "x", "--y", "y", "label"]) == 0
+    assert "a_export.csv: skipped (written by this export)" in capsys.readouterr().err
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.csv", "a_export.csv", "b.csv", "b_export.csv"]
+    assert (tmp_path / "a_export.csv").read_text().splitlines() == ["x,y,label", "1,2,p", "3,4,q"]
+
+
+def test_export_per_category(tmp_path, capsys):
+    path = tmp_path / "sales.csv"
+    path.write_text("region,revenue\nNorth,10\nSouth,20\nNorth,30\n")
+    assert main(["export", str(path), "--x", "region", "--agg", "per_value", "--func", "mean", "-o", "-", "-q"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["region,revenue", "North,20.0", "South,20.0"]
 
 
 def test_export_with_options(telemetry, tmp_path, capsys):
@@ -55,7 +85,7 @@ def test_export_config_to_directory_for_many_files(telemetry, tmp_path, capsys):
 def test_export_stdout_and_defaults(telemetry, capsys):
     assert main(["export", str(telemetry), "--n", "300", "-o", "-", "-q"]) == 0
     lines = capsys.readouterr().out.splitlines()
-    assert lines[0] == "time,speed,temp,rpm,on"
+    assert lines[0] == "time,speed,temp,rpm,on,label"  # every parameter, text included
     assert len(lines) == 3
 
 
@@ -85,6 +115,9 @@ def test_sample(tmp_path, capsys):
     path = tmp_path / "s.parquet"
     assert main(["sample", str(path), "--rows", "1000"]) == 0
     assert pl.read_parquet(path).height == 1000
+    assert main(["sample", str(tmp_path / "s.csv"), "--rows", "100"]) == 0
+    info = inspect_file(tmp_path / "s.csv")
+    assert info.num_rows == 100 and info.guess_x() == "timestamp" and info.column("flight_phase").kind == "text"
 
 
 @pytest.mark.parametrize(
@@ -108,6 +141,7 @@ def test_sample(tmp_path, capsys):
                          aggregation=AggregationConfig(method="every_nth", n=3)),
         ProcessingConfig(x="d", y=["a"], aggregation=AggregationConfig(method="target_points", points=99, functions=["std"]),
                          csv=CsvOptions(separator=";", decimal_comma=True)),
+        ProcessingConfig(x="region", y=["a", "b"], aggregation=AggregationConfig(method="per_value", functions=["mean", "last"])),
     ],
 )
 def test_config_to_args_round_trip(cfg):

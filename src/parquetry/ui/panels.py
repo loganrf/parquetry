@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -33,7 +35,17 @@ from ..durations import format_seconds, is_duration
 from ..processing import ProcessingError, parse_x_value, x_to_plot
 from .plot_area import RangeEntry, format_plot_x
 
-_KIND_LABEL = {"datetime": "time", "date": "date", "numeric": "number", "duration": "duration", "boolean": "bool"}
+_KIND_LABEL = {
+    "datetime": "time", "date": "date", "numeric": "number", "duration": "duration", "boolean": "bool", "text": "text",
+}
+#: Orders of the parameter list, with their labels.
+PARAMETER_SORTS = {"file": "File order", "name": "Name", "type": "Type"}
+_NUMBER = re.compile(r"(\d+)")
+
+
+def natural_key(text: str) -> list:
+    """Sort key that ignores case and orders numbers by value (ch2 before ch10)."""
+    return [int(part) if part.isdigit() else part.casefold() for part in _NUMBER.split(text)]
 
 
 class ParameterPanel(QGroupBox):
@@ -41,6 +53,7 @@ class ParameterPanel(QGroupBox):
 
     xChanged = Signal(str)
     yChanged = Signal()
+    sortChanged = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__("Parameters", parent)
@@ -62,6 +75,21 @@ class ParameterPanel(QGroupBox):
         self.tree.itemChanged.connect(self._item_changed)
         self.tree.itemDoubleClicked.connect(self._only_this)
         self.tree.setToolTip("Tick parameters to plot and export. Double-click to show only that parameter.")
+        header = self.tree.header()
+        header.setSectionsClickable(True)
+        header.sectionClicked.connect(self._header_clicked)
+        self.sort_combo = QComboBox()
+        for key, label in PARAMETER_SORTS.items():
+            self.sort_combo.addItem(label, key)
+        self.sort_combo.setToolTip(
+            "Order of the parameter list; clicking a column header also sorts by it.\n"
+            "Plots and exports keep the order in which parameters were ticked."
+        )
+        self.sort_combo.currentIndexChanged.connect(self._sort_changed)
+        self.reverse_button = QToolButton()
+        self.reverse_button.setCheckable(True)
+        self.reverse_button.setToolTip("Reverse the order")
+        self.reverse_button.toggled.connect(self._sort_changed)
         self.count_label = QLabel()
         select_all = QToolButton(text="All")
         select_all.setToolTip("Tick all visible parameters")
@@ -77,14 +105,21 @@ class ParameterPanel(QGroupBox):
         buttons.addWidget(self.count_label, 1)
         buttons.addWidget(select_all)
         buttons.addWidget(select_none)
+        title = QHBoxLayout()
+        title.addWidget(QLabel("Y parameters"), 1)
+        title.addWidget(QLabel("Sort"))
+        title.addWidget(self.sort_combo)
+        title.addWidget(self.reverse_button)
         layout = QVBoxLayout(self)
         layout.addLayout(form)
-        layout.addWidget(QLabel("Y parameters"))
+        layout.addLayout(title)
         layout.addWidget(self.filter_edit)
         layout.addWidget(self.tree, 1)
         layout.addLayout(buttons)
         self._updating = False
         self._order: list[str] = []
+        self._file_order: list[str] = []
+        self._sort_items()
 
     def set_dataset(self, info: DatasetInfo, x: str, y: list[str]) -> None:
         self._updating = True
@@ -102,10 +137,12 @@ class ParameterPanel(QGroupBox):
                 item.setCheckState(0, Qt.CheckState.Checked if col.name in y else Qt.CheckState.Unchecked)
                 item.setToolTip(0, col.name)
                 self.tree.addTopLevelItem(item)
-            self._order = [c for c in y if any(c == col.name for col in info.y_candidates)]
+            self._file_order = [col.name for col in info.y_candidates]
+            self._order = [c for c in y if c in self._file_order]
             self.filter_edit.clear()
         finally:
             self._updating = False
+        self._sort_items()
         self._update_count()
 
     def x(self) -> str:
@@ -123,7 +160,7 @@ class ParameterPanel(QGroupBox):
             if item.checkState(0) == Qt.CheckState.Checked:
                 checked.add(item.data(0, Qt.ItemDataRole.UserRole))
         order = [c for c in self._order if c in checked]
-        order += [c for c in self._all_names() if c in checked and c not in order]
+        order += [c for c in self._file_order if c in checked and c not in order]
         return [c for c in order if c != self.x()]
 
     def set_selected_y(self, names: list[str]) -> None:
@@ -147,8 +184,52 @@ class ParameterPanel(QGroupBox):
             it += 1
         return items
 
-    def _all_names(self) -> list[str]:
-        return [item.data(0, Qt.ItemDataRole.UserRole) for item in self._items()]
+    def sort_order(self) -> tuple[str, bool]:
+        """The list's order (a key of :data:`PARAMETER_SORTS`) and whether it is reversed."""
+        return self.sort_combo.currentData(), self.reverse_button.isChecked()
+
+    def set_sort(self, key: str, reverse: bool = False) -> None:
+        for widget in (self.sort_combo, self.reverse_button):
+            widget.blockSignals(True)
+        try:
+            self.sort_combo.setCurrentIndex(max(0, self.sort_combo.findData(key)))
+            self.reverse_button.setChecked(reverse)
+        finally:
+            for widget in (self.sort_combo, self.reverse_button):
+                widget.blockSignals(False)
+        self._sort_changed()
+
+    def _header_clicked(self, section: int) -> None:
+        key = "name" if section == 0 else "type"
+        if self.sort_combo.currentData() == key:
+            self.set_sort(key, not self.reverse_button.isChecked())
+        else:
+            self.set_sort(key)
+
+    def _sort_changed(self, *_args) -> None:
+        self._sort_items()
+        self.sortChanged.emit()
+
+    def _sort_items(self) -> None:
+        key, reverse = self.sort_order()
+        self.reverse_button.setArrowType(Qt.ArrowType.DownArrow if reverse else Qt.ArrowType.UpArrow)
+        header = self.tree.header()
+        header.setSortIndicatorShown(key != "file")
+        order = Qt.SortOrder.DescendingOrder if reverse else Qt.SortOrder.AscendingOrder
+        header.setSortIndicator(1 if key == "type" else 0, order)
+        position = {name: i for i, name in enumerate(self._file_order)}
+
+        def sort_key(item: QTreeWidgetItem):
+            name = item.data(0, Qt.ItemDataRole.UserRole)
+            if key == "name":
+                return natural_key(name)
+            if key == "type":
+                return natural_key(item.text(1)), natural_key(name)
+            return position.get(name, 0)
+
+        items = [self.tree.takeTopLevelItem(0) for _ in range(self.tree.topLevelItemCount())]
+        self.tree.addTopLevelItems(sorted(items, key=sort_key, reverse=reverse))
+        self._apply_filter(self.filter_edit.text())  # hiding does not survive taking items out
 
     def _x_changed(self) -> None:
         if not self._updating:
@@ -210,7 +291,8 @@ class AggregationPanel(QGroupBox):
             "Compact large files before plotting and exporting:\n"
             "• Every Nth row keeps one row out of N\n"
             "• Fixed interval buckets aggregates per time interval (e.g. 1 s, 1 min)\n"
-            "• Target number of points splits the x range into N equal buckets"
+            "• Target number of points splits the x range into N equal buckets\n"
+            "• One bucket per x value aggregates rows with the same x (e.g. per text category)"
         )
         self.method_combo.currentIndexChanged.connect(self._method_changed)
 
@@ -230,9 +312,11 @@ class AggregationPanel(QGroupBox):
         self.points_spin.valueChanged.connect(self.changed)
         self.param_stack = QStackedWidget()
         none_label = QLabel("All rows are used. Large files are reduced for display only.")
-        none_label.setWordWrap(True)
-        none_label.setStyleSheet("color: palette(placeholder-text);")
-        for widget in (none_label, self.n_spin, self.every_edit, self.points_spin):
+        per_value_label = QLabel("Rows with the same x value form one bucket.")
+        for label in (none_label, per_value_label):
+            label.setWordWrap(True)
+            label.setStyleSheet("color: palette(placeholder-text);")
+        for widget in (none_label, self.n_spin, self.every_edit, self.points_spin, per_value_label):
             self.param_stack.addWidget(widget)
 
         self.func_boxes: dict[str, QCheckBox] = {}
@@ -262,6 +346,12 @@ class AggregationPanel(QGroupBox):
     def set_x_kind(self, kind: str, is_duration: bool = False) -> None:
         self._x_kind = kind
         self._x_is_duration = is_duration
+        # Interval and equal-width buckets need numbers or times; text x aggregates per category.
+        model = self.method_combo.model()
+        for method in ("interval", "target_points"):
+            model.item(self.method_combo.findData(method)).setEnabled(kind != "category")
+        if kind == "category" and self.method_combo.currentData() in {"interval", "target_points"}:
+            self.method_combo.setCurrentIndex(self.method_combo.findData("per_value"))
         if kind == "datetime":
             self.every_edit.setPlaceholderText("duration, e.g. 500ms, 10s, 1m, 1h")
             self.every_edit.setToolTip("Bucket width as a duration: 500ms, 10s, 1m, 15m, 1h, 1d …")
@@ -314,7 +404,7 @@ class AggregationPanel(QGroupBox):
     def _method_changed(self, *_args, emit: bool = True) -> None:
         method = self.method_combo.currentData()
         self.param_stack.setCurrentIndex(AGG_METHODS.index(method))
-        self.funcs_widget.setEnabled(method in {"interval", "target_points"})
+        self.funcs_widget.setEnabled(method in {"interval", "target_points", "per_value"})
         if emit:
             self.changed.emit()
 
@@ -363,6 +453,10 @@ class RangePanel(QWidget):
     editRequested = Signal(int, object, object, object)  # index, lo, hi, label
 
     COLUMNS = ("#", "Label", "Start", "End", "Duration")
+    _HINT = (
+        "No ranges selected - exports include all data. Shift+drag on the plot, use range mode (R) "
+        "or “Add from view” to select time ranges for export."
+    )
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -376,7 +470,7 @@ class RangePanel(QWidget):
             "applied to other files recorded at different times."
         )
         self.mode_combo.currentIndexChanged.connect(self.modeChanged)
-        add = QPushButton("Add from view")
+        self.add_button = add = QPushButton("Add from view")
         add.setToolTip("Add a range covering the middle of the visible area")
         add.clicked.connect(self.addRequested)
         self.remove_button = QPushButton("Remove")
@@ -409,10 +503,7 @@ class RangePanel(QWidget):
         self.table.setColumnWidth(3, 210)
         self.table.itemChanged.connect(self._item_changed)
         self.table.cellDoubleClicked.connect(lambda row, col: col == 0 and self.zoomRequested.emit(row))
-        self.hint = QLabel(
-            "No ranges selected - exports include all data. Shift+drag on the plot, use range mode (R) "
-            "or “Add from view” to select time ranges for export."
-        )
+        self.hint = QLabel(self._HINT)
         self.hint.setWordWrap(True)
         self.hint.setStyleSheet("color: palette(placeholder-text);")
 
@@ -437,6 +528,10 @@ class RangePanel(QWidget):
         self._kind, self._tz = kind, tz
         suffix = " (UTC)" if kind == "datetime" and tz else ""
         self.table.setHorizontalHeaderLabels(["#", "Label", f"Start{suffix}", f"End{suffix}", "Duration"])
+        allowed = kind != "category"
+        self.mode_combo.setEnabled(allowed)
+        self.add_button.setEnabled(allowed)
+        self.hint.setText(self._HINT if allowed else "Ranges need a numeric or time x axis; the x axis is text.")
 
     def refresh(self, ranges: list[RangeEntry]) -> None:
         self._updating = True

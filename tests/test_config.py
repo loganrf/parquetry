@@ -29,6 +29,26 @@ def test_json_round_trip(tmp_path):
     assert loaded.ranges[1].start is None
 
 
+def test_output_columns_for_text():
+    agg = AggregationConfig(method="interval", functions=["mean", "max"])
+    cfg = ProcessingConfig(x="t", y=["v", "mode"], aggregation=agg)
+    assert cfg.output_columns({"mode"}) == [("v_mean", "v", "mean"), ("v_max", "v", "max"), ("mode_max", "mode", "max")]
+    agg.functions = ["mean", "std"]  # nothing applies to text: the first value
+    assert cfg.output_columns({"mode"})[-1] == ("mode_first", "mode", "first")
+    agg.functions = ["mean"]
+    assert cfg.output_columns({"mode"}) == [("v", "v", "mean"), ("mode", "mode", "first")]
+    assert cfg.output_columns() == [("v", "v", "mean"), ("mode", "mode", "mean")]
+
+
+def test_per_value_aggregation():
+    agg = AggregationConfig(method="group", functions=["count"])
+    assert agg.method == "per_value" and agg.is_bucketed
+    agg.validate()
+    assert agg.describe() == "count per x value"
+    assert agg.to_dict() == {"method": "per_value", "functions": ["count"]}
+    assert AggregationConfig.from_dict(agg.to_dict()) == agg
+
+
 def test_copy_is_deep():
     cfg = full_config()
     clone = cfg.copy()

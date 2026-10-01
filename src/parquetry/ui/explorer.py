@@ -1,4 +1,4 @@
-"""The explorer page: parameter selection, aggregation, plot and ranges."""
+"""The explorer page: parameter selection, aggregation, plot, ranges and data table."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QSplitter,
+    QTabWidget,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -22,15 +23,18 @@ from ..dataset import DatasetInfo, format_bytes
 from ..processing import (
     PlotData,
     ProcessingError,
+    TableData,
     data_bounds,
     format_x,
     load_plot_data,
+    load_table_data,
     merge_plot_data,
     plot_to_x,
     resolve_ranges,
     x_to_plot,
 )
 from . import workers
+from .data_table import DataPanel
 from .panels import AggregationPanel, ParameterPanel, RangePanel
 from .plot_area import PlotArea, format_plot_x
 
@@ -55,7 +59,7 @@ def _plot_job(info: DatasetInfo, cfg: ProcessingConfig, pending: ProcessingConfi
 
 
 class ExplorerPage(QWidget):
-    """Explore one Parquet file."""
+    """Explore one Parquet or CSV file."""
 
     busy = Signal(bool, str)
     status = Signal(str)
@@ -72,12 +76,16 @@ class ExplorerPage(QWidget):
         self._generation = 0
         self._pending: ProcessingConfig | None = None
         self._loaded_x: str | None = None
+        self._table_generation = 0
+        self._table_stale = True
 
         # -- widgets -----------------------------------------------------------
         self.file_label = QLabel()
         self.file_label.setTextFormat(Qt.TextFormat.RichText)
         self.file_label.setWordWrap(True)
         self.params = ParameterPanel()
+        self.params.set_sort(settings.value("parameters/sort", "file"), settings.value("parameters/reverse", False, type=bool))
+        self.params.sortChanged.connect(self._sort_changed)
         self.params.xChanged.connect(self._x_changed)
         self.params.yChanged.connect(self.schedule_update)
         self.aggregation = AggregationPanel()
@@ -109,6 +117,7 @@ class ExplorerPage(QWidget):
         self.plot.set_stacked(settings.value("plot/stacked", True, type=bool))
         self.plot.set_show_points(settings.value("plot/points", False, type=bool))
         self.plot.rangesChanged.connect(self._ranges_changed)
+        self.plot.viewChanged.connect(lambda *_: self._schedule_table())
         self.ranges_panel = RangePanel()
         self.ranges_panel.addRequested.connect(self.plot.add_range_from_view)
         self.ranges_panel.removeRequested.connect(self.plot.remove_range)
@@ -156,11 +165,19 @@ class ExplorerPage(QWidget):
         plot_layout.setSpacing(0)
         plot_layout.addWidget(self.detail_banner)
         plot_layout.addWidget(self.plot, 1)
+        self.data_panel = DataPanel()
+        self.bottom_tabs = QTabWidget()
+        self.bottom_tabs.setDocumentMode(True)
+        self.bottom_tabs.addTab(self.ranges_panel, "Ranges")
+        self.bottom_tabs.addTab(self.data_panel, "Data")
+        self.bottom_tabs.setTabToolTip(1, "The rows behind the visible part of the plot, including text columns")
+        self.bottom_tabs.setCurrentIndex(settings.value("explorer/bottom_tab", 0, type=int))
+        self.bottom_tabs.currentChanged.connect(self._bottom_tab_changed)
         right.addWidget(plot_box)
-        right.addWidget(self.ranges_panel)
+        right.addWidget(self.bottom_tabs)
         right.setStretchFactor(0, 4)
         right.setStretchFactor(1, 1)
-        right.setSizes([600, 170])
+        right.setSizes([600, 200])
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.addWidget(sidebar)
         self.splitter.addWidget(right)
@@ -181,6 +198,10 @@ class ExplorerPage(QWidget):
         self._update_timer.setSingleShot(True)
         self._update_timer.setInterval(300)
         self._update_timer.timeout.connect(self.update_plot)
+        self._table_timer = QTimer(self)
+        self._table_timer.setSingleShot(True)
+        self._table_timer.setInterval(250)
+        self._table_timer.timeout.connect(self.update_table)
 
     # ----------------------------------------------------------------- actions
     def _build_actions(self) -> None:
@@ -195,7 +216,7 @@ class ExplorerPage(QWidget):
             act.setCheckable(checkable)
             return act
 
-        self.act_open = action("Open…", "Ctrl+O", "Choose another Parquet file")
+        self.act_open = action("Open…", "Ctrl+O", "Choose another Parquet or CSV file")
         self.act_open.triggered.connect(self.openRequested)
         self.act_select = action("Range mode", "R", "Left-drag on the plot selects an x range (Shift+drag works anytime)", True)
         self.act_select.toggled.connect(self.plot.set_select_mode)
@@ -230,6 +251,21 @@ class ExplorerPage(QWidget):
         self.settings.setValue("plot/points", on)
         self.plot.set_show_points(on)
 
+    def _sort_changed(self) -> None:
+        key, reverse = self.params.sort_order()
+        self.settings.setValue("parameters/sort", key)
+        self.settings.setValue("parameters/reverse", reverse)
+
+    def update_actions(self) -> None:
+        """Enable the actions that suit the x axis and the plot (while the page is shown)."""
+        if not self.toolbar.isEnabled():
+            return  # the main window disables everything while the file browser is shown
+        ranges = self.plot.allow_ranges
+        for act in (self.act_select, self.act_add_range, self.act_zoom_ranges):
+            act.setEnabled(ranges)
+        data = self._overview
+        self.act_detail.setEnabled(bool(data and data.reduced and data.x_kind != "category"))
+
     # ----------------------------------------------------------------- dataset
     def set_dataset(self, info: DatasetInfo, cfg: ProcessingConfig | None = None) -> list[str]:
         """Show *info*; optionally apply a configuration. Returns warnings."""
@@ -237,6 +273,9 @@ class ExplorerPage(QWidget):
         self._overview = None
         self._loaded_x = None
         self.plot.clear()
+        self._table_generation += 1  # drop rows still loading for the previous file
+        self.data_panel.set_message("Loading…")
+        self._table_stale = True
         details = f"{info.num_rows:,} rows · {len(info.columns)} columns · {format_bytes(info.size_bytes)}"
         self.file_label.setText(f"<b>{info.path.name}</b><br><span style='color:gray'>{details}</span>")
         self.file_label.setToolTip(str(info.path))
@@ -282,6 +321,8 @@ class ExplorerPage(QWidget):
         kind = info.x_kind(x)
         self.aggregation.set_x_kind(kind, col.kind == "duration")
         self.ranges_panel.set_x_kind(kind, col.time_zone)
+        self.plot.set_allow_ranges(kind != "category")
+        self.update_actions()
 
     def _x_changed(self, x: str) -> None:
         if self.info is None:
@@ -316,6 +357,8 @@ class ExplorerPage(QWidget):
             return []
         x = self.params.x()
         kind = self.info.x_kind(x)
+        if kind == "category":
+            return []
         tz = self.info.column(x).time_zone
         start = self._data_start(x) if mode == "relative" else None
         out = []
@@ -385,6 +428,7 @@ class ExplorerPage(QWidget):
         if spans is not None:
             self.plot.set_ranges(spans)
         self._update_detail_banner()
+        self._schedule_table()
         rows = f"{data.rows:,}"
         if not data.series:
             self.aggregation.set_estimate("")
@@ -405,11 +449,16 @@ class ExplorerPage(QWidget):
     def _update_detail_banner(self, detail_view=None) -> None:
         data = self._overview
         reduced = bool(data and data.reduced)
-        self.act_detail.setEnabled(reduced)
+        self.update_actions()
         if not reduced:
             self.detail_banner.hide()
             return
-        if detail_view:
+        if data.x_kind == "category":
+            text = (
+                f"This view shows the lowest and highest values of {data.rows:,} rows per category; "
+                "exports always use the full data. Aggregate per x value to see fewer points."
+            )
+        elif detail_view:
             lo, hi = detail_view
             text = (
                 f"Full detail loaded for {format_plot_x(lo, data.x_kind, False)} – "
@@ -450,9 +499,54 @@ class ExplorerPage(QWidget):
         self._update_detail_banner(view)
         self.status.emit(f"Loaded {detail.points:,} points for the visible area")
 
+    # ------------------------------------------------------------------ table
+    def _table_shown(self) -> bool:
+        return self.bottom_tabs.currentWidget() is self.data_panel and self.data_panel.isVisible()
+
+    def _bottom_tab_changed(self, index: int) -> None:
+        self.settings.setValue("explorer/bottom_tab", index)
+        if self._table_stale and self._table_shown():
+            self.update_table()
+
+    def _schedule_table(self) -> None:
+        """Reload the table soon if it is shown, otherwise when it is shown next."""
+        self._table_stale = True
+        if self.info is not None and self._table_shown():
+            self._table_timer.start()
+
+    def update_table(self) -> None:
+        self._table_timer.stop()
+        if self.info is None or not self.aggregation.is_valid():
+            return
+        cfg = self.current_config()
+        cfg.ranges = []
+        data = self.plot.data
+        # Rows of the visible x window, when the plot shows the current x axis.
+        follow = data is not None and data.series and data.x_name == cfg.x and data.x_kind != "category"
+        view = self.plot.view_range() if follow else None
+        self._table_stale = False
+        self._table_generation += 1
+        generation = self._table_generation
+        info = self.info
+        workers.submit(
+            lambda: load_table_data(info, cfg, view=view),
+            on_done=lambda table: self._table_loaded(generation, table),
+            on_error=lambda exc: self._table_failed(generation, exc),
+        )
+
+    def _table_loaded(self, generation: int, table: TableData) -> None:
+        if generation == self._table_generation:
+            self.data_panel.set_table(table)
+
+    def _table_failed(self, generation: int, exc: BaseException) -> None:
+        if generation == self._table_generation:
+            self.data_panel.set_message(f"Could not load the rows: {exc}")
+
     # ----------------------------------------------------------------- ranges
     def _ranges_changed(self) -> None:
-        self.ranges_panel.refresh(self.plot.ranges())
+        ranges = self.plot.ranges()
+        self.ranges_panel.refresh(ranges)
+        self.bottom_tabs.setTabText(0, f"Ranges ({len(ranges)})" if ranges else "Ranges")
 
     def _range_edited(self, index: int, lo, hi, label) -> None:
         if index >= len(self.plot.ranges()):

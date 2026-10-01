@@ -46,6 +46,7 @@ from ..processing import (
     ProcessingError,
     estimate_rows,
     export_file,
+    output_columns,
     plan_outputs,
     preview_csv,
     render_output_path,
@@ -86,7 +87,8 @@ def save_config_interactive(parent: QWidget, settings: QSettings, cfg: Processin
         return None
     settings.setValue("config/last_dir", str(path.parent))
     folder = info.path.parent if info else Path(".")
-    command = command_line([str(folder / "*.parquet")], config_path=str(path))
+    pattern = f"*{info.path.suffix.lower()}" if info and info.path.suffix else "*.parquet"
+    command = command_line([str(folder / pattern)], config_path=str(path))
     box = QMessageBox(parent)
     box.setWindowTitle("Configuration saved")
     box.setIcon(QMessageBox.Icon.Information)
@@ -151,6 +153,9 @@ class ExportDialog(QDialog):
         self.sort_check = QCheckBox("Sort rows by x")
         self.sort_check.setChecked(cfg.sort)
         self.sort_check.setToolTip("Disable only for files that are already sorted by x (saves time and memory)")
+        if kind == "category":
+            self.sort_check.setEnabled(False)
+            self.sort_check.setToolTip("Rows keep the file's order when the x axis is text")
         data_box = QGroupBox("Data")
         data_form = QFormLayout(data_box)
         scope_row = QHBoxLayout()
@@ -196,6 +201,8 @@ class ExportDialog(QDialog):
         if kind == "datetime":
             for key, label in TIME_FORMAT_LABELS.items():
                 self.time_combo.addItem(label, key)
+        elif kind == "category":
+            self.time_combo.addItem("Raw x values", "iso")
         else:
             self.time_combo.addItem("Raw x values", "iso")
             self.time_combo.addItem("Offset from data start", "elapsed_s")
@@ -334,7 +341,7 @@ class ExportDialog(QDialog):
         cfg.aggregation = self._aggregation()
         x = cfg.x
         rows = [(x, ROW_INDEX_LABEL if x == ROW_INDEX else f"{x}  (x)")]
-        rows += [(name, name) for name, _, _ in cfg.output_columns()]
+        rows += [(name, name) for name, _, _ in output_columns(cfg, self.info)]
         return rows
 
     def _fill_columns(self) -> None:

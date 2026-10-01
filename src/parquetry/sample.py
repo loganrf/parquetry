@@ -9,6 +9,8 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
+from .dataset import CSV_SUFFIXES
+
 
 def generate_sample(
     path: str | os.PathLike,
@@ -17,7 +19,10 @@ def generate_sample(
     start: dt.datetime = dt.datetime(2024, 6, 1, 8, 0, 0),
     seed: int = 7,
 ) -> Path:
-    """Write a flight-test style telemetry file with ``rows`` samples at ``rate_hz``."""
+    """Write a flight-test style telemetry file with ``rows`` samples at ``rate_hz``.
+
+    The file is Parquet unless *path* ends in ``.csv`` or ``.tsv``.
+    """
     rng = np.random.default_rng(seed)
     step_us = round(1e6 / rate_hz)
     t = np.arange(rows, dtype=np.int64) * step_us
@@ -59,5 +64,8 @@ def generate_sample(
     ).with_columns(pl.col("battery_v").fill_nan(None))
     path = Path(path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(path, compression="zstd", row_group_size=250_000, statistics=True)
+    if path.suffix.lower() in CSV_SUFFIXES:
+        df.write_csv(path, separator="\t" if path.suffix.lower() == ".tsv" else ",")
+    else:
+        df.write_parquet(path, compression="zstd", row_group_size=250_000, statistics=True)
     return path
