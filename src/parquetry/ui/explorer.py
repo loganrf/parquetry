@@ -107,6 +107,7 @@ class ExplorerPage(QWidget):
 
         self.plot = PlotArea()
         self.plot.set_stacked(settings.value("plot/stacked", True, type=bool))
+        self.plot.set_show_points(settings.value("plot/points", False, type=bool))
         self.plot.rangesChanged.connect(self._ranges_changed)
         self.ranges_panel = RangePanel()
         self.ranges_panel.addRequested.connect(self.plot.add_range_from_view)
@@ -134,6 +135,7 @@ class ExplorerPage(QWidget):
             self.act_zoom_ranges,
             None,
             self.act_stacked,
+            self.act_points,
             self.act_auto_y,
             self.act_reset,
             self.act_detail,
@@ -204,6 +206,9 @@ class ExplorerPage(QWidget):
         self.act_stacked = action("Stacked", "S", "One plot per parameter (off: overlay all parameters)", True)
         self.act_stacked.setChecked(self.plot.stacked)
         self.act_stacked.toggled.connect(self._set_stacked)
+        self.act_points = action("Points", "P", "Mark every data point, so values between gaps (nulls) stay visible", True)
+        self.act_points.setChecked(self.plot.show_points)
+        self.act_points.toggled.connect(self._set_show_points)
         self.act_auto_y = action("Auto Y", "Y", "Fit the y axis to the visible data", True)
         self.act_auto_y.setChecked(True)
         self.act_auto_y.toggled.connect(self.plot.set_auto_y)
@@ -220,6 +225,10 @@ class ExplorerPage(QWidget):
     def _set_stacked(self, on: bool) -> None:
         self.settings.setValue("plot/stacked", on)
         self.plot.set_stacked(on)
+
+    def _set_show_points(self, on: bool) -> None:
+        self.settings.setValue("plot/points", on)
+        self.plot.set_show_points(on)
 
     # ----------------------------------------------------------------- dataset
     def set_dataset(self, info: DatasetInfo, cfg: ProcessingConfig | None = None) -> list[str]:

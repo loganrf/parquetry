@@ -3,6 +3,7 @@
 import functools
 import os
 
+import numpy as np
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -13,12 +14,13 @@ from PySide6.QtCore import QSettings, Qt  # noqa: E402
 from PySide6.QtWidgets import QMessageBox  # noqa: E402
 
 from parquetry.config import AggregationConfig, ProcessingConfig, TimeRange  # noqa: E402
-from parquetry.processing import load_plot_data  # noqa: E402
+from parquetry.processing import PlotData, PlotSeries, load_plot_data  # noqa: E402
 from parquetry.ui import workers  # noqa: E402
 from parquetry.ui.app import create_app  # noqa: E402
 from parquetry.ui.batch_dialog import BatchDialog  # noqa: E402
 from parquetry.ui.export_dialog import ExportDialog, path_to_template  # noqa: E402
 from parquetry.ui.main_window import MainWindow  # noqa: E402
+from parquetry.ui.plot_area import PlotArea  # noqa: E402
 
 from .conftest import START  # noqa: E402
 
@@ -227,3 +229,55 @@ def test_changing_x_clears_stale_plot_and_ranges(explorer, qtbot):
     assert explorer.current_config().ranges[0].to_dict() == {"start": 10.0, "end": 20.0}
     idle(qtbot)
     qtbot.waitUntil(lambda: explorer.plot.data is not None and explorer.plot.data.x_kind == "numeric", timeout=10000)
+
+
+def point_items(plot):
+    return [item for item in plot.listDataItems() if item.opts["symbol"] is not None]
+
+
+def test_points_show_values_between_gaps(qtbot):
+    create_app()
+    area = PlotArea()
+    qtbot.addWidget(area)
+    area.resize(600, 300)
+    area.show()
+    qtbot.waitExposed(area)
+    y = np.array([np.nan, 1.0, np.nan, np.nan, 2.0, 3.0, np.nan])
+    area.set_data(PlotData("x", "numeric", None, [PlotSeries("v", "v", None, np.arange(7.0), y)], 7, bounds=(0.0, 6.0)))
+    qtbot.waitUntil(lambda: area.view_range()[1] >= 6.0)  # toggling points keeps the view
+    assert point_items(area._plots[0]) == []
+    area.set_show_points(True)
+    [points] = point_items(area._plots[0])
+    xs, ys = points.getOriginalDataset()
+    assert xs.tolist() == [1.0, 4.0, 5.0] and ys.tolist() == [1.0, 2.0, 3.0]
+    qtbot.waitUntil(lambda: len(points.scatter.data) == 3)  # 1.0 has no neighbour to draw a line to
+    area.set_show_points(False)
+    assert point_items(area._plots[0]) == []
+
+
+def test_points_action(explorer, settings):
+    assert not any(point_items(plot) for plot in explorer.plot._plots)
+    explorer.act_points.setChecked(True)
+    assert settings.value("plot/points", type=bool)
+    speed, temp = (point_items(plot)[0].getOriginalDataset()[1] for plot in explorer.plot._plots)
+    assert len(speed) == 600 and len(temp) == 594  # temp has six nulls
+
+
+def test_shortcut_keys_can_be_typed_into_text_fields(explorer, qtbot):
+    window = explorer.window()
+    with qtbot.waitActive(window):
+        window.activateWindow()
+    explorer.params.tree.setFocus()
+    qtbot.keyClick(explorer.params.tree, Qt.Key.Key_S)
+    assert not explorer.act_stacked.isChecked()  # the single-key shortcuts work outside text fields
+    explorer.params.filter_edit.setFocus()
+    qtbot.keyClicks(explorer.params.filter_edit, "rpsa")
+    assert explorer.params.filter_edit.text() == "rpsa"
+    assert not explorer.act_select.isChecked() and not explorer.act_points.isChecked()
+    assert not explorer.act_stacked.isChecked() and explorer.plot.ranges() == []
+    agg = explorer.aggregation
+    agg.method_combo.setCurrentIndex(agg.method_combo.findData("interval"))
+    agg.every_edit.clear()
+    agg.every_edit.setFocus()
+    qtbot.keyClicks(agg.every_edit, "1d")
+    assert agg.every_edit.text() == "1d"

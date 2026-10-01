@@ -95,7 +95,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(quit_action)
 
         view_menu = self.menuBar().addMenu("&View")
-        for action in (ex.act_stacked, ex.act_auto_y, ex.act_reset, ex.act_detail):
+        for action in (ex.act_stacked, ex.act_points, ex.act_auto_y, ex.act_reset, ex.act_detail):
             view_menu.addAction(action)
         ranges_menu = self.menuBar().addMenu("&Ranges")
         for action in (ex.act_select, ex.act_add_range, ex.act_zoom_ranges):
@@ -114,7 +114,7 @@ class MainWindow(QMainWindow):
         # Actions that only make sense while a file is shown (several have single-key shortcuts).
         self._file_actions = [
             ex.act_load_config, ex.act_save_config, ex.act_export, ex.act_select, ex.act_add_range,
-            ex.act_zoom_ranges, ex.act_stacked, ex.act_auto_y, ex.act_reset, clear,
+            ex.act_zoom_ranges, ex.act_stacked, ex.act_points, ex.act_auto_y, ex.act_reset, clear,
         ]
 
     def _fill_recent_menu(self) -> None:

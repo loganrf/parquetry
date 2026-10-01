@@ -112,6 +112,7 @@ class PlotArea(QWidget):
 
         self.data: PlotData | None = None
         self.stacked = True
+        self.show_points = False
         self.auto_y = True
         self.select_mode = False
         self._plots: list[pg.PlotItem] = []
@@ -147,6 +148,11 @@ class PlotArea(QWidget):
     def set_stacked(self, stacked: bool) -> None:
         if stacked != self.stacked:
             self.stacked = stacked
+            self.set_data(self.data)
+
+    def set_show_points(self, enabled: bool) -> None:
+        if enabled != self.show_points:
+            self.show_points = enabled
             self.set_data(self.data)
 
     def set_auto_y(self, enabled: bool) -> None:
@@ -268,10 +274,22 @@ class PlotArea(QWidget):
                 curve.setDownsampling(auto=True, method="peak")
                 curve.setClipToView(True)
                 curves[series.func] = curve
+                if self.show_points:
+                    self._add_points(plot, series, pen.color())
             if "min" in curves and "max" in curves:
                 band = pg.FillBetweenItem(curves["min"], curves["max"], brush=with_alpha(color, 45))
                 band.setZValue(-5)
                 plot.addItem(band)
+
+    def _add_points(self, plot: pg.PlotItem, series: PlotSeries, color: QColor) -> None:
+        """Mark every sample, so values between gaps (nulls) show without a line."""
+        # Only finite samples: downsampling turns every chunk containing a NaN into NaN.
+        finite = np.isfinite(series.x) & np.isfinite(series.y)
+        points = plot.plot(
+            series.x[finite], series.y[finite], pen=None, symbol="o", symbolSize=5, symbolPen=None, symbolBrush=color
+        )
+        points.setDownsampling(auto=True, method="peak")
+        points.setClipToView(True)
 
     def _apply_y_mode(self, plot: pg.PlotItem) -> None:
         vb = plot.getViewBox()

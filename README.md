@@ -17,8 +17,8 @@ tool that replays what you set up in the app on any number of similar files.
 - **Aggregation to compact data:** every Nth row, fixed interval buckets (`500ms`,
   `1m`, `1h`, …) or a target number of buckets, with mean, min, max, median,
   first, last, sum, count and std.
-- **Interactive plot:** stacked or overlaid, crosshair readout, scroll to zoom,
-  and drag to select time ranges.
+- **Interactive plot:** stacked or overlaid, optional point markers, crosshair
+  readout, scroll to zoom, and drag to select time ranges.
 - **CSV export:** separator, time format (ISO, custom strftime, epoch, elapsed
   seconds), precision, decimal comma, missing values, quoting, line endings,
   BOM, column renames, one file per range, all with a live preview.
@@ -91,9 +91,11 @@ parquetry flight.parquet                         # or open a file directly
    exports both use this aggregation.
 4. **Explore the plot.** Scroll to zoom and drag to pan. *Auto Y* fits the y axis
    to the visible data, *Stacked* switches between one plot per parameter and a
-   single overlay, and the readout under the plot shows the values under the
-   cursor. When the plot shows a min/max envelope of a large file, zoom in and
-   press **D** to load full detail for that region.
+   single overlay, and *Points* marks every data point, so values surrounded by
+   gaps (nulls), which no line can connect, stay visible. The readout under the
+   plot shows the values under the cursor. When the plot shows a min/max
+   envelope of a large file, zoom in and press **D** to load full detail for
+   that region.
 5. **Select ranges.** **Shift+drag** on the plot, or turn on **Range mode (R)**
    and drag, or press **Add range (A)**. Ranges can be moved and resized on the
    plot, edited or labelled in the table below it, and removed from the table or
@@ -117,6 +119,7 @@ parquetry flight.parquet                         # or open a file directly
 | A | Add a range in the middle of the view |
 | Z | Zoom to the selected ranges |
 | S | Toggle stacked / overlay |
+| P | Toggle point markers |
 | Y | Toggle automatic y scaling |
 | D | Load full detail for the visible area |
 | Ctrl+0 | Reset zoom |
