@@ -2,7 +2,8 @@
 
 Everything here is lazy polars under the hood, so only the columns that are
 needed are read, range filters are pushed down into the Parquet scan and
-results are streamed to disk where possible. The same functions back the
+results are streamed to disk where possible. CSV input goes through the same
+queries, read with the column types found when the file was inspected. The same functions back the
 command line interface and the desktop UI, which guarantees that a saved
 configuration produces exactly what the UI showed.
 """
@@ -28,8 +29,8 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import polars as pl
 
-from .config import LINE_TERMINATORS, ConfigError, ProcessingConfig, TimeRange
-from .dataset import PARQUET_SUFFIXES, ROW_INDEX, DatasetInfo, inspect_parquet
+from .config import AGG_METHOD_LABELS, LINE_TERMINATORS, ConfigError, ProcessingConfig, TimeRange
+from .dataset import DATA_SUFFIXES, ROW_INDEX, DatasetInfo, inspect_file
 from .durations import is_duration, parse_duration_us, parse_offset_seconds, to_polars_duration
 
 UTC = dt.timezone.utc
@@ -234,7 +235,16 @@ def validate_for(cfg: ProcessingConfig, info: DatasetInfo, *, require_y: bool = 
         raise ProcessingError(f"Column(s) not found in {name}: {', '.join(missing)}")
     bad = [f"{y} ({info.column(y).dtype_name})" for y in cfg.y if not info.column(y).plottable]
     if bad:
-        raise ProcessingError(f"Only numeric or boolean columns can be y parameters: {', '.join(bad)}")
+        raise ProcessingError(f"Only numeric, boolean or text columns can be y parameters: {', '.join(bad)}")
+    if info.x_kind(cfg.x) == "category":
+        method = cfg.aggregation.method
+        if method in {"interval", "target_points"}:
+            raise ProcessingError(
+                f"Aggregation {AGG_METHOD_LABELS[method].lower()!r} needs a numeric or time x axis, but "
+                f"{cfg.x!r} is text; use per_value to aggregate per category"
+            )
+        if cfg.ranges:
+            raise ProcessingError(f"Ranges need a numeric or time x axis, but {cfg.x!r} is text")
     if cfg.aggregation.method == "interval":
         _interval_width(cfg, info)  # raises on a mismatch between x type and interval
 
@@ -269,7 +279,7 @@ def _interval_width(cfg: ProcessingConfig, info: DatasetInfo) -> str | float:
 
 def _scan(info: DatasetInfo, x: str, columns: Sequence[str]) -> pl.LazyFrame:
     """Lazy frame with *columns* normalised for processing and null x rows removed."""
-    lf = pl.scan_parquet(info.path)
+    lf = info.scan()
     if ROW_INDEX in columns:
         lf = lf.with_row_index(ROW_INDEX)
     exprs = []
@@ -282,6 +292,8 @@ def _scan(info: DatasetInfo, x: str, columns: Sequence[str]) -> pl.LazyFrame:
             expr = _us_to_seconds(expr.dt.total_microseconds())
         elif isinstance(col.dtype, pl.Decimal):
             expr = expr.cast(pl.Float64)
+        elif col.kind == "text" and col.dtype != pl.String:
+            expr = expr.cast(pl.String)  # categoricals
         exprs.append(expr.alias(name))
     lf = lf.select(exprs)
     keep = pl.col(x).is_not_null()
@@ -315,6 +327,28 @@ def data_bounds(info: DatasetInfo, x: str) -> Bounds | None:
             _bounds_cache.clear()
         _bounds_cache[key] = result
     return result
+
+
+_distinct_cache: dict[tuple, int] = {}
+
+
+def _distinct_x(info: DatasetInfo, x: str, resolved: Resolved) -> int:
+    """Number of distinct x values within *resolved* (cached per file version)."""
+    key = (*info.cache_key(), x, tuple(resolved))
+    with _bounds_lock:
+        if key in _distinct_cache:
+            return _distinct_cache[key]
+    kind, tz = _x_meta(info, x)
+    lf = _scan(info, x, [x])
+    predicate = _range_predicate(x, resolved, kind, tz)
+    if predicate is not None:
+        lf = lf.filter(predicate)
+    count = int(lf.select(pl.col(x).n_unique()).collect().item())
+    with _bounds_lock:
+        if len(_distinct_cache) > 256:
+            _distinct_cache.clear()
+        _distinct_cache[key] = count
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +464,11 @@ def _interval_bucket(x: str, kind: str, width: str | float, integer: bool) -> pl
     return (pl.col(x) / width).floor() * width
 
 
+def output_columns(cfg: ProcessingConfig, info: DatasetInfo) -> list[tuple[str, str, str | None]]:
+    """``(output name, source column, function)`` of every value column *cfg* produces for *info*."""
+    return cfg.output_columns(info.text_columns)
+
+
 def _aggregate(lf: pl.LazyFrame, info: DatasetInfo, cfg: ProcessingConfig, span: Bounds | None) -> pl.LazyFrame:
     agg = cfg.aggregation
     if agg.method == "none":
@@ -439,17 +478,21 @@ def _aggregate(lf: pl.LazyFrame, info: DatasetInfo, cfg: ProcessingConfig, span:
     x = cfg.x
     kind, tz = _x_meta(info, x)
     integer = info.column(x).dtype.is_integer()
-    if agg.method == "interval":
+    if agg.method == "per_value":
+        bucket = pl.col(x)
+    elif agg.method == "interval":
         bucket = _interval_bucket(x, kind, _interval_width(cfg, info), integer)
     else:
         bucket = _points_bucket(x, kind, tz, span, agg.points, integer)
     values = []
-    for out_name, source, func in cfg.output_columns():
+    for out_name, source, func in output_columns(cfg, info):
         expr = pl.col(source)
         if info.column(source).kind == "boolean":
             expr = expr.cast(pl.Int32)
         values.append(_AGG_EXPRS[func](expr).alias(out_name))
-    return lf.group_by(bucket.alias(x), maintain_order=True).agg(values).sort(x)
+    out = lf.group_by(bucket.alias(x), maintain_order=True).agg(values)
+    # Categories stay in order of appearance, like the rows they come from.
+    return out if kind == "category" else out.sort(x)
 
 
 def processed_frame(
@@ -460,7 +503,10 @@ def processed_frame(
     row_limit: int | None = None,
     sort: bool | None = None,
 ) -> pl.LazyFrame:
-    """x plus value columns after range filtering, sorting and aggregation."""
+    """x plus value columns after range filtering, sorting and aggregation.
+
+    Rows are never sorted by a text x column: categories keep the file's order.
+    """
     x = cfg.x
     ys = [c for c in dict.fromkeys(cfg.y) if c != x]
     kind, tz = _x_meta(info, x)
@@ -470,7 +516,7 @@ def processed_frame(
         lf = lf.filter(predicate)
     if row_limit is not None:
         lf = lf.head(row_limit)
-    if cfg.sort if sort is None else sort:
+    if (cfg.sort if sort is None else sort) and kind != "category":
         lf = lf.sort(x)
     return _aggregate(lf, info, cfg, _span(info, x, resolved))
 
@@ -487,6 +533,8 @@ def estimate_rows(info: DatasetInfo, cfg: ProcessingConfig, resolved: Resolved |
         return math.ceil(rows / max(1, agg.n))
     if agg.method == "target_points":
         return int(min(rows, agg.points * max(1, len(resolved))))
+    if agg.method == "per_value":
+        return _distinct_x(info, cfg.x, resolved)
     data = data_bounds(info, cfg.x)
     if data is None:
         return 0
@@ -534,7 +582,7 @@ def csv_frame(lf: pl.LazyFrame, info: DatasetInfo, cfg: ProcessingConfig) -> pl.
     kind, _ = _x_meta(info, x)
     fmt = cfg.csv.time_format
     expr = None
-    if fmt == "elapsed_s":
+    if fmt == "elapsed_s" and kind != "category":
         data = data_bounds(info, x)
         base = data.lo if data else None
         if base is not None:
@@ -548,7 +596,7 @@ def csv_frame(lf: pl.LazyFrame, info: DatasetInfo, cfg: ProcessingConfig) -> pl.
         expr = pl.col(x).dt.epoch("ms")
     if expr is not None:
         lf = lf.with_columns(expr.alias(x))
-    names = [x, *(name for name, _, _ in cfg.output_columns())]
+    names = [x, *(name for name, _, _ in output_columns(cfg, info))]
     rename = {k: v for k, v in cfg.csv.rename.items() if k in names and v and v != k}
     if x == ROW_INDEX and x not in rename:
         rename[x] = ROW_INDEX_HEADER
@@ -597,12 +645,16 @@ class OutputPlan:
 
 
 def plan_outputs(
-    info: DatasetInfo,
+    info: DatasetInfo | Path,
     cfg: ProcessingConfig,
     output: str | None = None,
     base_dir: Path | None = None,
 ) -> list[OutputPlan]:
-    """Work out which files an export writes (one per range when splitting)."""
+    """Work out which files an export of *info* (or the file at that path) writes.
+
+    That is one file per range when splitting ranges.
+    """
+    source = info.path if isinstance(info, DatasetInfo) else Path(info)
     template = output or cfg.output.path
     if template == "-":
         if cfg.output.split_ranges and len(cfg.ranges) > 1:
@@ -615,16 +667,42 @@ def plan_outputs(
         plans = []
         for number, rng in enumerate(cfg.ranges, 1):
             label = rng.label or str(number)
-            plans.append(OutputPlan(render_output_path(template, info.path, label, base_dir), [rng], label))
+            plans.append(OutputPlan(render_output_path(template, source, label, base_dir), [rng], label))
         paths = [p.path for p in plans]
         if len(set(paths)) != len(paths):
             raise ProcessingError("Several ranges map to the same output file; give the ranges unique labels")
     else:
-        plans = [OutputPlan(render_output_path(template, info.path, "all", base_dir), list(cfg.ranges))]
+        plans = [OutputPlan(render_output_path(template, source, "all", base_dir), list(cfg.ranges))]
     for plan in plans:
-        if plan.path is not None and plan.path.resolve() == info.path.resolve():
-            raise ProcessingError(f"Refusing to overwrite the input file {info.path}")
+        if plan.path is not None and plan.path.resolve() == source.resolve():
+            raise ProcessingError(f"Refusing to overwrite the input file {source}")
     return plans
+
+
+def exclude_outputs(
+    inputs: Sequence[Path],
+    cfg: ProcessingConfig,
+    output: str | None = None,
+    base_dir: Path | None = None,
+) -> tuple[list[Path], list[Path]]:
+    """Split *inputs* into files to export and files that exporting the others writes.
+
+    A folder of CSV files also holds the results of earlier exports (such as
+    ``flight_export.csv`` next to ``flight.csv``), which must not be exported
+    again when the export is repeated.
+    """
+    targets = set()
+    for path in inputs:
+        try:
+            plans = plan_outputs(Path(path), cfg, output, base_dir)
+        except ProcessingError:
+            continue  # reported when the file itself is exported
+        targets.update(plan.path.resolve() for plan in plans if plan.path is not None)
+    keep: list[Path] = []
+    skipped: list[Path] = []
+    for path in inputs:
+        (skipped if Path(path).resolve() in targets else keep).append(path)
+    return keep, skipped
 
 
 @dataclass
@@ -655,13 +733,13 @@ def export_file(
     overwrite: bool = True,
     stream: Any = None,
 ) -> ExportResult:
-    """Export one Parquet file to CSV according to *cfg*.
+    """Export one Parquet or CSV file to CSV according to *cfg*.
 
     ``output`` overrides ``cfg.output.path`` (``"-"`` writes to *stream*,
     standard output by default). Relative output paths are resolved against
     *base_dir*, or the input file's directory when not given.
     """
-    info = source if isinstance(source, DatasetInfo) else inspect_parquet(source)
+    info = source if isinstance(source, DatasetInfo) else inspect_file(source)
     validate_for(cfg, info)
     result = ExportResult(info.path)
     for plan in plan_outputs(info, cfg, output, base_dir):
@@ -701,7 +779,7 @@ def preview_csv(
     preview fast for large files (aggregated values of the last bucket may
     therefore differ from the real export).
     """
-    info = source if isinstance(source, DatasetInfo) else inspect_parquet(source)
+    info = source if isinstance(source, DatasetInfo) else inspect_file(source)
     validate_for(cfg, info)
     # When writing one file per range, preview the first one.
     ranges = cfg.ranges[:1] if cfg.output.split_ranges else cfg.ranges
@@ -719,7 +797,7 @@ def preview_csv(
 
 
 def find_inputs(paths: Iterable[str | os.PathLike], recursive: bool = False) -> list[Path]:
-    """Expand files, directories and glob patterns into a list of Parquet files."""
+    """Expand files, directories and glob patterns into a list of Parquet and CSV files."""
     found: list[Path] = []
     for item in paths:
         text = os.fspath(item)
@@ -731,7 +809,7 @@ def find_inputs(paths: Iterable[str | os.PathLike], recursive: bool = False) -> 
         if path.is_dir():
             pattern = "**/*" if recursive else "*"
             found.extend(
-                sorted(p for p in path.glob(pattern) if p.is_file() and p.suffix.lower() in PARQUET_SUFFIXES)
+                sorted(p for p in path.glob(pattern) if p.is_file() and p.suffix.lower() in DATA_SUFFIXES)
             )
         else:
             found.append(path)
@@ -769,6 +847,10 @@ def batch_export(
 # ---------------------------------------------------------------------------
 
 
+#: Plots with a text x axis draw a marker per row, so they are reduced sooner.
+CATEGORY_MAX_POINTS = 100_000
+
+
 @dataclass
 class PlotSeries:
     name: str
@@ -776,6 +858,8 @@ class PlotSeries:
     func: str | None
     x: np.ndarray
     y: np.ndarray
+    #: For text values: the category names that the y positions 0, 1, 2, ... stand for.
+    categories: list[str] | None = None
 
 
 @dataclass
@@ -792,6 +876,8 @@ class PlotData:
     bounds: tuple[float, float] | None = None
     #: When set, the data only covers this x window (detail load).
     view: tuple[float, float] | None = None
+    #: For a text x axis: the category names at x positions 0, 1, 2, ...
+    x_categories: list[str] | None = None
 
     @property
     def points(self) -> int:
@@ -802,6 +888,34 @@ def _plot_x(x: str, kind: str) -> pl.Expr:
     if kind == "datetime":
         return pl.col(x).dt.epoch("us").cast(pl.Float64) / 1e6
     return pl.col(x).cast(pl.Float64)
+
+
+def _text_outputs(info: DatasetInfo, columns: list[tuple[str, str, str | None]]) -> dict[str, str]:
+    """Output columns that hold text, mapped to their source column."""
+    return {name: src for name, src, func in columns if info.column(src).kind == "text" and func != "count"}
+
+
+def _categories(
+    frame: pl.DataFrame | pl.LazyFrame, x: str | None, texts: dict[str, str]
+) -> tuple[list[str] | None, dict[str, list[str]]]:
+    """Categories of a text x column *x* (in order of appearance) and of the text
+    outputs *texts* (sorted, shared by all outputs of a source column)."""
+    exprs = [pl.col(name).drop_nulls().unique().implode().alias(name) for name in texts]
+    if x is not None:
+        exprs.append(pl.col(x).unique(maintain_order=True).implode().alias(x))
+    if not exprs:
+        return None, {}
+    row = frame.select(exprs)
+    row = (row.collect() if isinstance(row, pl.LazyFrame) else row).row(0, named=True)
+    values: dict[str, set[str]] = {}
+    for name, src in texts.items():
+        values.setdefault(src, set()).update(row[name])
+    return (row[x] if x is not None else None), {src: sorted(v) for src, v in values.items()}
+
+
+def _codes(name: str, categories: list[str], dtype: pl.DataType = pl.Float64) -> pl.Expr:
+    """Position of each value of column *name* in *categories*."""
+    return pl.col(name).replace_strict(categories, list(range(len(categories))), default=None, return_dtype=dtype)
 
 
 def load_plot_data(
@@ -820,41 +934,66 @@ def load_plot_data(
     peaks; exports are never affected by this. *view* restricts loading to an
     x window given in plot units, which is used to fetch full detail for a
     zoomed-in region.
+
+    Text is plotted by position: a text x column at 0, 1, 2, ... in order of
+    appearance (see ``x_categories``), text values at the position of their
+    sorted categories (see ``PlotSeries.categories``).
     """
-    info = source if isinstance(source, DatasetInfo) else inspect_parquet(source)
+    info = source if isinstance(source, DatasetInfo) else inspect_file(source)
     validate_for(cfg, info, require_y=False)
     x = cfg.x
     kind, tz = _x_meta(info, x)
-    data = data_bounds(info, x)
+    category = kind == "category"
+    columns = output_columns(cfg, info)
+    texts = _text_outputs(info, columns)
+    data = None
+    if category:
+        view = None  # positions depend on the loaded categories, so there is no detail to load
+        max_points = min(max_points, CATEGORY_MAX_POINTS)
+    else:
+        data = data_bounds(info, x)
     bounds = (x_to_plot(data.lo, kind), x_to_plot(data.hi, kind)) if data else None
-    columns = cfg.output_columns()
     result = PlotData(x, kind, tz, [], 0, bounds=bounds, view=view)
-    if data is None or not columns:
+    if not columns or (data is None and not category):
         return result
     resolved: Resolved = []
     if view is not None:
         resolved = [(plot_to_x(view[0], kind, tz), plot_to_x(view[1], kind, tz))]
     estimate = estimate_rows(info, cfg, resolved)
     result.rows = estimate
-    if estimate <= max_points:
-        df = (
-            processed_frame(info, cfg, resolved)
-            .select(_plot_x(x, kind).alias(x), *(pl.col(name).cast(pl.Float64) for name, _, _ in columns))
-            .collect()
-        )
+    reduce = estimate > max_points
+    # Row order does not matter for the envelope, so skip the (expensive) sort
+    # when nothing downstream depends on it.
+    lf = processed_frame(info, cfg, resolved, sort=False if reduce and cfg.aggregation.method == "none" else None)
+    frame: pl.DataFrame | pl.LazyFrame = lf if reduce else lf.collect()
+    x_categories, categories = _categories(frame, x if category else None, texts)
+    encode = [_codes(name, categories[src]) for name, src in texts.items()]
+    if category:
+        encode.append(_codes(x, x_categories, pl.Int64))
+        result.x_categories = x_categories
+        result.bounds = (0.0, float(len(x_categories) - 1)) if x_categories else None
+        kind = "numeric"  # from here on x holds category positions
+    if encode:
+        frame = frame.with_columns(encode)
+
+    def series(name: str, src: str, func: str | None, xs: np.ndarray, ys: np.ndarray) -> PlotSeries:
+        return PlotSeries(name, src, func, xs, ys, categories.get(src) if name in texts else None)
+
+    if not reduce:
+        df = frame.select(_plot_x(x, kind).alias(x), *(pl.col(name).cast(pl.Float64) for name, _, _ in columns))
         xs = df[x].to_numpy()
         result.rows = df.height
-        result.series = [PlotSeries(name, src, func, xs, df[name].to_numpy()) for name, src, func in columns]
+        result.series = [series(name, src, func, xs, df[name].to_numpy()) for name, src, func in columns]
         return result
 
     # Too many rows to draw: reduce to the positions of the min and max of
     # every value column within each of `envelope_buckets` buckets.
     result.reduced = True
-    # Row order does not matter for the envelope, so skip the (expensive) sort
-    # when nothing downstream depends on it.
-    lf = processed_frame(info, cfg, resolved, sort=False if cfg.aggregation.method == "none" else None)
-    span = Bounds(*resolved[0]) if resolved else data
-    integer = lf.collect_schema()[x].is_integer()
+    if category:
+        span, integer = Bounds(0, max(0, len(x_categories) - 1)), True
+    else:
+        span = Bounds(*resolved[0]) if resolved else data
+        integer = frame.collect_schema()[x].is_integer()
     bucket = _points_bucket(x, kind, tz, span, envelope_buckets, integer)
     xpos = pl.col("__x__")
     aggs = []
@@ -867,7 +1006,7 @@ def load_plot_data(
             xpos.get(value.arg_max()).alias(f"xhi{i}"),
         ]
     df = (
-        lf.with_columns(_plot_x(x, kind).alias("__x__"), *(pl.col(n).cast(pl.Float64) for n, _, _ in columns))
+        frame.with_columns(_plot_x(x, kind).alias("__x__"), *(pl.col(n).cast(pl.Float64) for n, _, _ in columns))
         .group_by(bucket.alias(_BUCKET))
         .agg(aggs)
         .sort(_BUCKET)
@@ -885,8 +1024,16 @@ def load_plot_data(
         xs[1::2] = np.where(low_first, xhi, xlo)
         ys[0::2] = np.where(low_first, ylo, yhi)
         ys[1::2] = np.where(low_first, yhi, ylo)
-        result.series.append(PlotSeries(name, src, func, xs, ys))
+        result.series.append(series(name, src, func, xs, ys))
     return result
+
+
+def _recode(codes: np.ndarray, old: list[str], new: list[str]) -> np.ndarray:
+    """Translate category positions in *old* into positions in *new*."""
+    position = {name: i for i, name in enumerate(new)}
+    lookup = np.array([position.get(name, np.nan) for name in old] + [np.nan], dtype=np.float64)
+    index = np.where(np.isfinite(codes), codes, len(old)).astype(np.int64)
+    return lookup[index]
 
 
 def merge_plot_data(overview: PlotData, detail: PlotData) -> PlotData:
@@ -901,6 +1048,9 @@ def merge_plot_data(overview: PlotData, detail: PlotData) -> PlotData:
         if extra is None:
             merged.append(series)
             continue
+        extra_y = extra.y
+        if series.categories is not None and extra.categories is not None and extra.categories != series.categories:
+            extra_y = _recode(extra.y, extra.categories, series.categories)
         left = series.x < lo
         right = series.x > hi
         merged.append(
@@ -909,7 +1059,8 @@ def merge_plot_data(overview: PlotData, detail: PlotData) -> PlotData:
                 series.column,
                 series.func,
                 np.concatenate([series.x[left], extra.x, series.x[right]]),
-                np.concatenate([series.y[left], extra.y, series.y[right]]),
+                np.concatenate([series.y[left], extra_y, series.y[right]]),
+                series.categories,
             )
         )
     return PlotData(
@@ -920,4 +1071,49 @@ def merge_plot_data(overview: PlotData, detail: PlotData) -> PlotData:
         overview.rows,
         reduced=overview.reduced,
         bounds=overview.bounds,
+        x_categories=overview.x_categories,
     )
+
+
+# ---------------------------------------------------------------------------
+# table data
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TableData:
+    """Processed rows for display: the x column followed by the value columns."""
+
+    frame: pl.DataFrame
+    x_kind: str
+    #: Rows the configuration produces (an estimate when the frame is truncated).
+    rows: int
+    #: True when ``frame`` holds only the first of these rows.
+    truncated: bool = False
+    #: True when the rows were limited to an x window.
+    windowed: bool = False
+
+
+def load_table_data(
+    source: str | os.PathLike | DatasetInfo,
+    cfg: ProcessingConfig,
+    *,
+    limit: int = 50_000,
+    view: tuple[float, float] | None = None,
+) -> TableData:
+    """The first *limit* processed rows, as an export would write them.
+
+    *view* is an x window in plot units that the rows are limited to (ignored
+    for a text x axis). Ranges in *cfg* are ignored, as for plots, but values
+    are not converted: text stays text.
+    """
+    info = source if isinstance(source, DatasetInfo) else inspect_file(source)
+    validate_for(cfg, info, require_y=False)
+    kind, tz = _x_meta(info, cfg.x)
+    resolved: Resolved = []
+    if view is not None and kind != "category":
+        resolved = [(plot_to_x(view[0], kind, tz), plot_to_x(view[1], kind, tz))]
+    df = processed_frame(info, cfg, resolved).head(limit + 1).collect()
+    truncated = df.height > limit
+    rows = max(estimate_rows(info, cfg, resolved), df.height) if truncated else df.height
+    return TableData(df.head(limit), kind, rows, truncated, bool(resolved))

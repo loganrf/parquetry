@@ -1,9 +1,15 @@
-"""Interactive plot: stacked or overlaid series, crosshair readout and x ranges."""
+"""Interactive plot: stacked or overlaid series, crosshair readout and x ranges.
+
+Text is drawn by position: a text x axis shows one bar or marker column per
+category, and text values are step lines on an axis labelled with the
+category names.
+"""
 
 from __future__ import annotations
 
 import datetime as dt
 import html
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -17,6 +23,7 @@ from .theme import PlotTheme, current_theme, with_alpha
 
 _MINMAX = {"min", "max"}
 _LINE_STYLES = (Qt.PenStyle.SolidLine, Qt.PenStyle.DashLine, Qt.PenStyle.DotLine, Qt.PenStyle.DashDotLine)
+_BAR_ALPHA = (220, 150, 95, 60)  # functions of one parameter, side by side
 AXIS_WIDTH = 72
 
 
@@ -37,6 +44,44 @@ def format_value(value: float) -> str:
     if value != 0 and (abs(value) >= 1e7 or abs(value) < 1e-3):
         return f"{value:.4e}"
     return f"{value:.6g}"
+
+
+def category_name(categories: list[str], position: float | None) -> str:
+    """The category at a plot position, or a dash outside the categories."""
+    if position is None or not np.isfinite(position):
+        return "–"
+    index = round(position)
+    return categories[index] if 0 <= index < len(categories) else "–"
+
+
+def shorten(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+class CategoryAxis(pg.AxisItem):
+    """Axis labelled with category names at the integer positions 0, 1, 2, ..."""
+
+    def __init__(self, orientation: str, categories: list[str]) -> None:
+        super().__init__(orientation=orientation)
+        self.enableAutoSIPrefix(False)
+        self.categories = categories
+        vertical = orientation in ("left", "right")
+        self._chars = 10 if vertical else 18
+        longest = min(max((len(c) for c in categories), default=1), self._chars)
+        # Room along the axis for one label: a line of text, or the label's width.
+        self._label_px = 16 if vertical else 7 * longest + 14
+
+    def tickValues(self, minVal, maxVal, size):  # noqa: N802 - pyqtgraph naming
+        lo = max(0, math.ceil(min(minVal, maxVal)))
+        hi = min(len(self.categories) - 1, math.floor(max(minVal, maxVal)))
+        if hi < lo or size <= 0:
+            return []
+        step = max(1, math.ceil((hi - lo + 1) * self._label_px / size))
+        first = math.ceil(lo / step) * step
+        return [(float(step), [float(v) for v in range(first, hi + 1, step)])]
+
+    def tickStrings(self, values, scale, spacing):  # noqa: N802 - pyqtgraph naming
+        return [shorten(category_name(self.categories, v), self._chars) for v in values]
 
 
 @dataclass
@@ -77,7 +122,9 @@ class SelectViewBox(pg.ViewBox):
         self._area = area
 
     def mouseDragEvent(self, ev, axis=None):  # noqa: N802 - Qt naming
-        selecting = self._area.select_mode or bool(ev.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        selecting = self._area.allow_ranges and (
+            self._area.select_mode or bool(ev.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        )
         if axis is None and ev.button() == Qt.MouseButton.LeftButton and selecting:
             ev.accept()
             x0 = self.mapSceneToView(ev.buttonDownScenePos()).x()
@@ -115,6 +162,8 @@ class PlotArea(QWidget):
         self.show_points = False
         self.auto_y = True
         self.select_mode = False
+        #: Whether ranges can be selected (not on a text x axis).
+        self.allow_ranges = True
         self._plots: list[pg.PlotItem] = []
         self._vlines: list[pg.InfiniteLine] = []
         self._previews: list[pg.LinearRegionItem] = []
@@ -133,11 +182,21 @@ class PlotArea(QWidget):
 
     def set_data(self, data: PlotData | None, keep_view: bool = True, message: str | None = None) -> None:
         view = self.view_range() if keep_view and self._plots else None
+        if self.data is not None and data is not None and self.data.x_categories != data.x_categories:
+            view = None  # positions stand for other categories now
         self.data = data
         self._assign_colors()
         self._rebuild(message)
         if view is not None and self._plots:
             self.set_x_view(*view, padding=0)
+        elif self._category_span():
+            self.set_x_view(*self._category_span(), padding=0.01)
+
+    def _category_span(self) -> tuple[float, float] | None:
+        """Every category with room for its bars, which automatic ranging would cut in half."""
+        if self.kind != "category" or not self.data.x_categories or not self._plots:
+            return None
+        return -0.5, len(self.data.x_categories) - 0.5
 
     def clear(self) -> None:
         self._ranges.clear()
@@ -162,7 +221,12 @@ class PlotArea(QWidget):
 
     def set_select_mode(self, enabled: bool) -> None:
         self.select_mode = enabled
-        self.glw.setCursor(Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor)
+        self.glw.setCursor(Qt.CursorShape.CrossCursor if enabled and self.allow_ranges else Qt.CursorShape.ArrowCursor)
+
+    def set_allow_ranges(self, allowed: bool) -> None:
+        self.allow_ranges = allowed
+        self.set_select_mode(self.select_mode)
+        self._show_hint()
 
     def color_for(self, column: str) -> QColor:
         return self.theme.series_color(self._slots.get(column, 0))
@@ -177,10 +241,17 @@ class PlotArea(QWidget):
                 self._slots[column] = next(i for i in range(len(columns) + len(used) + 1) if i not in used)
 
     # ---------------------------------------------------------------- build
-    def _groups(self) -> dict[str, list[PlotSeries]]:
-        groups: dict[str, list[PlotSeries]] = {}
+    def _groups(self) -> dict[tuple[str | None, bool], list[PlotSeries]]:
+        """Series per plot, keyed by (parameter or None for the overlay, text).
+
+        Stacked plots show one parameter each; the overlay shows all numbers
+        together. Text needs its own category axis, so it is never overlaid.
+        """
+        groups: dict[tuple[str | None, bool], list[PlotSeries]] = {}
         for series in self.data.series:
-            groups.setdefault(series.column if self.stacked else "", []).append(series)
+            text = series.categories is not None
+            key = (series.column if self.stacked or text else None, text)
+            groups.setdefault(key, []).append(series)
         return groups
 
     def _rebuild(self, message: str | None = None) -> None:
@@ -193,10 +264,10 @@ class PlotArea(QWidget):
             self._show_placeholder(message or "Select one or more parameters to plot")
             return
         groups = self._groups()
-        for row, (column, series_list) in enumerate(groups.items()):
+        for row, ((column, _text), series_list) in enumerate(groups.items()):
             last = row == len(groups) - 1
-            plot = self._make_plot(row, last)
-            if self.stacked:
+            plot = self._make_plot(row, last, series_list[0].categories)
+            if column is not None:
                 plot.setLabel("left", column, color=self.theme.text_muted)
             self._add_series(plot, series_list)
             self._plots.append(plot)
@@ -208,13 +279,18 @@ class PlotArea(QWidget):
         for number, entry in enumerate(self._ranges, 1):
             self._create_regions(entry, number)
 
-    def _make_plot(self, row: int, last: bool) -> pg.PlotItem:
+    def _make_plot(self, row: int, last: bool, categories: list[str] | None = None) -> pg.PlotItem:
         vb = SelectViewBox(self)
         if self.kind == "datetime":
             bottom = pg.DateAxisItem(orientation="bottom", utcOffset=0)
+        elif self.kind == "category":
+            bottom = CategoryAxis("bottom", self.data.x_categories or [])
         else:
             bottom = pg.AxisItem(orientation="bottom")
-        plot = self.glw.addPlot(row=row, col=0, viewBox=vb, axisItems={"bottom": bottom})
+        axes = {"bottom": bottom}
+        if categories is not None:
+            axes["left"] = CategoryAxis("left", categories)
+        plot = self.glw.addPlot(row=row, col=0, viewBox=vb, axisItems=axes)
         plot.showGrid(x=True, y=True, alpha=0.12)
         plot.setMenuEnabled(True)
         plot.hideButtons()
@@ -245,12 +321,19 @@ class PlotArea(QWidget):
             return func or series.column
         return f"{series.column} ({func})" if func else series.column
 
+    def _as_bars(self, series: PlotSeries) -> bool:
+        """Numbers on a text x axis with one value per category are drawn as bars."""
+        if self.kind != "category" or series.categories is not None:
+            return False
+        return len(np.unique(series.x)) == len(series.x)
+
     def _add_series(self, plot: pg.PlotItem, series_list: list[PlotSeries]) -> None:
         columns = list(dict.fromkeys(s.column for s in series_list))
         needs_legend = len(series_list) > 1
         if needs_legend:
             legend = plot.addLegend(offset=(8, 6), labelTextColor=self.theme.text, brush=with_alpha(self.theme.surface, 200))
             legend.setZValue(20)
+        bars = [id(s) for s in series_list if self._as_bars(s)]
         for column in columns:
             members = [s for s in series_list if s.column == column]
             color = self.color_for(column)
@@ -258,38 +341,60 @@ class PlotArea(QWidget):
             base_style = _LINE_STYLES[(slot // len(self.theme.series)) % len(_LINE_STYLES)]
             other_funcs = [s.func for s in members if s.func not in _MINMAX]
             funcs = {s.func for s in members}
-            band = _MINMAX <= funcs
+            # A shaded min–max band, unless the values are text or bars.
+            band = _MINMAX <= funcs and members[0].categories is None and self.kind != "category"
             curves: dict[str | None, pg.PlotDataItem] = {}
-            for series in members:
+            for number, series in enumerate(members):
                 name = self._series_label(series) if needs_legend else None
-                if series.func in _MINMAX:
+                if id(series) in bars:
+                    brush = with_alpha(color, _BAR_ALPHA[number % len(_BAR_ALPHA)])
+                    self._add_bars(plot, series, bars.index(id(series)), len(bars), brush, name)
+                    continue
+                if band and series.func in _MINMAX:
                     pen = pg.mkPen(with_alpha(color, 150), width=1)
-                    if band:  # one legend entry for the shaded min–max band
-                        name = self._series_label(series, "min–max") if name and series.func == "min" else None
+                    name = self._series_label(series, "min–max") if name and series.func == "min" else None
                 else:
-                    index = other_funcs.index(series.func)
+                    index = other_funcs.index(series.func) if series.func in other_funcs else number
                     style = _LINE_STYLES[index % len(_LINE_STYLES)] if index else base_style
                     pen = pg.mkPen(color, width=1, style=style)
-                curve = plot.plot(series.x, series.y, pen=pen, name=name, connect="finite")
+                if self.kind == "category":
+                    # Several values per category: markers, since lines between categories mean nothing.
+                    self._add_points(plot, series, pen.color(), name)
+                    continue
+                x, y = (series.x, series.y) if series.categories is None else _steps(series.x, series.y)
+                curve = plot.plot(x, y, pen=pen, name=name, connect="finite")
                 curve.setDownsampling(auto=True, method="peak")
                 curve.setClipToView(True)
                 curves[series.func] = curve
                 if self.show_points:
                     self._add_points(plot, series, pen.color())
-            if "min" in curves and "max" in curves:
+            if band and "min" in curves and "max" in curves:
                 band = pg.FillBetweenItem(curves["min"], curves["max"], brush=with_alpha(color, 45))
                 band.setZValue(-5)
                 plot.addItem(band)
 
-    def _add_points(self, plot: pg.PlotItem, series: PlotSeries, color: QColor) -> None:
+    def _add_points(self, plot: pg.PlotItem, series: PlotSeries, color: QColor, name: str | None = None) -> None:
         """Mark every sample, so values between gaps (nulls) show without a line."""
         # Only finite samples: downsampling turns every chunk containing a NaN into NaN.
         finite = np.isfinite(series.x) & np.isfinite(series.y)
         points = plot.plot(
-            series.x[finite], series.y[finite], pen=None, symbol="o", symbolSize=5, symbolPen=None, symbolBrush=color
+            series.x[finite], series.y[finite], pen=None, symbol="o", symbolSize=5, symbolPen=None, symbolBrush=color,
+            name=name,
         )
-        points.setDownsampling(auto=True, method="peak")
+        if self.kind != "category":  # downsampling assumes x is sorted
+            points.setDownsampling(auto=True, method="peak")
         points.setClipToView(True)
+
+    def _add_bars(self, plot: pg.PlotItem, series: PlotSeries, index: int, count: int, brush: QColor, name: str | None) -> None:
+        """One bar per category; several series share each category's slot side by side."""
+        finite = np.isfinite(series.x) & np.isfinite(series.y)
+        width = 0.8 / count
+        offset = (index - (count - 1) / 2) * width
+        bars = pg.BarGraphItem(
+            x=series.x[finite] + offset, height=series.y[finite], width=width * 0.92, brush=brush,
+            pen=pg.mkPen(with_alpha(brush, 255), width=1), name=name,
+        )
+        plot.addItem(bars)
 
     def _apply_y_mode(self, plot: pg.PlotItem) -> None:
         vb = plot.getViewBox()
@@ -330,6 +435,8 @@ class PlotArea(QWidget):
             plot.enableAutoRange()
             if self.auto_y:
                 plot.getViewBox().setAutoVisible(y=True)
+        if self._category_span():
+            self.set_x_view(*self._category_span(), padding=0.01)
 
     def _on_x_range_changed(self, _vb, rng) -> None:
         self.viewChanged.emit(float(rng[0]), float(rng[1]))
@@ -355,7 +462,7 @@ class PlotArea(QWidget):
 
     def add_range_from_view(self) -> RangeEntry | None:
         view = self.view_range()
-        if view is None:
+        if view is None or not self.allow_ranges:
             return None
         lo, hi = view
         if self.data and self.data.bounds:
@@ -478,9 +585,10 @@ class PlotArea(QWidget):
 
     # ------------------------------------------------------------- crosshair
     def _show_hint(self) -> None:
+        ranges = " · <b>Shift+drag</b> or range mode (<b>R</b>) to select a range" if self.allow_ranges else ""
         self.readout.setText(
-            f"<span style='color:{self.theme.text_muted}'>Scroll to zoom · drag to pan · "
-            "<b>Shift+drag</b> or range mode (<b>R</b>) to select a range · right-click for options</span>"
+            f"<span style='color:{self.theme.text_muted}'>Scroll to zoom · drag to pan{ranges} · "
+            "right-click for options</span>"
         )
 
     def _on_mouse_moved(self, event) -> None:
@@ -501,22 +609,48 @@ class PlotArea(QWidget):
         for line in self._vlines:
             line.setPos(x)
             line.show()
-        parts = [f"<b>{html.escape(format_plot_x(x, self.kind))}</b>"]
+        if self.kind == "category":
+            x_text = category_name(self.data.x_categories or [], x)
+        else:
+            x_text = format_plot_x(x, self.kind)
+        parts = [f"<b>{html.escape(x_text)}</b>"]
         for series in self.data.series:
-            value = _value_at(series, x)
             swatch = self.color_for(series.column).name()
             label = f"{series.column} ({series.func})" if series.func else series.column
             parts.append(
                 f"<span style='color:{swatch}'>■</span> {html.escape(label)} "
-                f"<span style='font-family:monospace'>{format_value(value)}</span>"
+                f"<span style='font-family:monospace'>{html.escape(self._value_text(series, x))}</span>"
             )
         self.readout.setText("&nbsp;&nbsp; ".join(parts))
+
+    def _value_text(self, series: PlotSeries, x: float) -> str:
+        def text(value: float | None) -> str:
+            return format_value(value) if series.categories is None else category_name(series.categories, value)
+
+        if self.kind != "category":
+            return text(_value_at(series, x))
+        values = series.y[(series.x == round(x)) & np.isfinite(series.y)]
+        if len(values) <= 1:
+            return text(values[0] if len(values) else None)
+        if series.categories is not None:
+            return f"{len(values)} values"
+        return f"{text(values.min())} … {text(values.max())} ({len(values)} values)"
+
+
+def _steps(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Vertices of a line that holds each value until the next sample."""
+    if len(x) < 2:
+        return x, y
+    return np.repeat(x, 2)[1:], np.repeat(y, 2)[:-1]
 
 
 def _value_at(series: PlotSeries, x: float) -> float | None:
     xs = series.x
     if len(xs) == 0:
         return None
+    if series.categories is not None:  # text holds its value until the next sample
+        j = int(np.searchsorted(xs, x, side="right")) - 1
+        return float(series.y[j]) if j >= 0 else None
     i = int(np.searchsorted(xs, x))
     if i <= 0:
         j = 0

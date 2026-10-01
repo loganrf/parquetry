@@ -4,6 +4,7 @@ import functools
 import os
 
 import numpy as np
+import pyqtgraph as pg
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -14,13 +15,14 @@ from PySide6.QtCore import QSettings, Qt  # noqa: E402
 from PySide6.QtWidgets import QMessageBox  # noqa: E402
 
 from parquetry.config import AggregationConfig, ProcessingConfig, TimeRange  # noqa: E402
+from parquetry.dataset import ROW_INDEX  # noqa: E402
 from parquetry.processing import PlotData, PlotSeries, load_plot_data  # noqa: E402
 from parquetry.ui import workers  # noqa: E402
 from parquetry.ui.app import create_app  # noqa: E402
 from parquetry.ui.batch_dialog import BatchDialog  # noqa: E402
 from parquetry.ui.export_dialog import ExportDialog, path_to_template  # noqa: E402
 from parquetry.ui.main_window import MainWindow  # noqa: E402
-from parquetry.ui.plot_area import PlotArea  # noqa: E402
+from parquetry.ui.plot_area import CategoryAxis, PlotArea  # noqa: E402
 
 from .conftest import START  # noqa: E402
 
@@ -52,6 +54,13 @@ def window(qtbot, settings, monkeypatch):
     win.show()
     yield win
     idle(qtbot)
+
+
+@pytest.fixture
+def sales_csv(tmp_path):
+    path = tmp_path / "sales.csv"
+    path.write_text("region;revenue;status\nNorth;10,5;ok\nSouth;20;late\nNorth;30;ok\nEast;5;ok\n")
+    return path
 
 
 @pytest.fixture
@@ -281,3 +290,78 @@ def test_shortcut_keys_can_be_typed_into_text_fields(explorer, qtbot):
     agg.every_edit.setFocus()
     qtbot.keyClicks(agg.every_edit, "1d")
     assert agg.every_edit.text() == "1d"
+
+
+def test_browser_previews_csv(window, sales_csv, qtbot):
+    window.browser._preview(sales_csv)
+    idle(qtbot)
+    assert window.browser.summary_labels["Format"].text() == "CSV (semicolon separated, decimal comma)"
+    assert window.browser.summary_labels["Rows"].text() == "4"
+
+
+def test_text_x_axis(window, sales_csv, qtbot):
+    window.open_file(sales_csv)
+    idle(qtbot)
+    ex = window.explorer
+    assert ex.params.x() == ROW_INDEX and ex.params.selected_y() == ["revenue", "region"]
+    ex.aggregation.set_config(AggregationConfig(method="interval", every=2))
+    ex.params.set_x("region")
+    assert ex.aggregation.config().method == "per_value"  # interval buckets need numbers or times
+    assert not ex.act_add_range.isEnabled() and not ex.ranges_panel.add_button.isEnabled()
+    ex.params.set_selected_y(["revenue"])
+    ex.update_plot()
+    idle(qtbot)
+    plot = ex.plot._plots[0]
+    assert isinstance(plot.getAxis("bottom"), CategoryAxis)
+    assert plot.getAxis("bottom").categories == ["North", "South", "East"]
+    [bars] = [item for item in plot.items if isinstance(item, pg.BarGraphItem)]
+    assert bars.opts["height"].tolist() == [20.25, 20.0, 5.0]
+    assert ex.plot.add_range_from_view() is None and ex.current_config().ranges == []
+    ex.plot._on_mouse_moved((plot.getViewBox().mapViewToScene(pg.Point(1, 10)),))
+    assert "South" in ex.plot.readout.text() and "20" in ex.plot.readout.text()
+    ex.params.set_x(ROW_INDEX)
+    assert ex.act_add_range.isEnabled() and ex.plot.allow_ranges
+
+
+def test_text_values_are_steps_on_a_named_axis(qtbot):
+    create_app()
+    area = PlotArea()
+    qtbot.addWidget(area)
+    series = PlotSeries("mode", "mode", None, np.array([0.0, 1.0, 2.0]), np.array([0.0, 1.0, np.nan]), ["off", "on"])
+    area.set_data(PlotData("t", "numeric", None, [series], 3, bounds=(0.0, 2.0)))
+    axis = area._plots[0].getAxis("left")
+    assert isinstance(axis, CategoryAxis) and axis.tickStrings([0.0, 1.0, 5.0], 1, 1) == ["off", "on", "–"]
+    [curve] = area._plots[0].listDataItems()
+    xs, ys = curve.getOriginalDataset()
+    assert xs.tolist() == [0, 1, 1, 2, 2] and ys[:4].tolist() == [0, 0, 1, 1]
+    assert area._value_text(series, 1.5) == "on"  # a text value holds until the next sample
+
+
+def test_category_axis_thins_labels():
+    axis = CategoryAxis("bottom", [f"c{i}" for i in range(1000)])
+    [(step, values)] = axis.tickValues(-0.5, 999.5, 500)
+    assert step > 1 and values[0] == 0 and len(values) * step >= 1000
+
+
+def test_data_tab_follows_plot(explorer, qtbot):
+    explorer.params.set_selected_y(["speed", "label"])
+    explorer.bottom_tabs.setCurrentWidget(explorer.data_panel)
+    model = explorer.data_panel.model
+    qtbot.waitUntil(lambda: model.rowCount() == 600 and model.columnCount() == 3, timeout=10000)
+    assert [model.headerData(i, Qt.Orientation.Horizontal) for i in range(3)] == ["time", "speed", "label"]
+    assert [model.data(model.index(1, i)) for i in range(3)] == ["2024-01-01 00:00:00.100000", "1.0", "a"]
+    explorer.plot.set_x_view(EPOCH_START + 10, EPOCH_START + 20, padding=0)
+    qtbot.waitUntil(lambda: model.rowCount() == 101, timeout=10000)
+    assert explorer.data_panel.status.text() == "101 rows in view"
+
+
+def test_batch_dialog_skips_its_own_outputs(qtbot, settings, tmp_path):
+    for name in ("a", "b", "a_export"):
+        (tmp_path / f"{name}.csv").write_text("x,y\n1,2\n")
+    dialog = BatchDialog(settings, ProcessingConfig(x="x", y=["y"]), [tmp_path])
+    qtbot.addWidget(dialog)
+    assert dialog.inputs.count() == 3
+    dialog._run()
+    idle(qtbot)
+    log = dialog.log.toPlainText()
+    assert "a_export.csv: skipped" in log and "2 succeeded, 0 failed" in log

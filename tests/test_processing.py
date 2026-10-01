@@ -49,7 +49,8 @@ def test_inspect(telemetry):
     info = inspect_parquet(telemetry)
     assert info.num_rows == 600
     assert info.guess_x() == "time"
-    assert [c.name for c in info.y_candidates] == ["speed", "temp", "rpm", "on"]
+    assert [c.name for c in info.y_candidates] == ["speed", "temp", "rpm", "on", "label"]
+    assert info.column("label").kind == "text" and info.x_kind("label") == "category"
     assert info.column("time").dtype_name == "Datetime[us]"
     assert info.default_y("time") == ["speed", "temp"]
 
@@ -192,14 +193,26 @@ def test_row_index_x(telemetry):
     "change, message",
     [
         ({"y": ["nope"]}, "not found"),
-        ({"y": ["label"]}, "Only numeric or boolean"),
-        ({"x": "label"}, "cannot be used as the x axis"),
+        ({"y": ["tags"]}, "Only numeric, boolean or text"),
+        ({"x": "tags"}, "cannot be used as the x axis"),
         ({"aggregation": AggregationConfig(method="interval", every="abc")}, "neither a duration"),
+        ({"x": "label", "aggregation": AggregationConfig(method="interval", every=1)}, "use per_value"),
+        ({"x": "label", "aggregation": AggregationConfig(method="target_points")}, "needs a numeric or time x axis"),
+        ({"x": "label", "ranges": [TimeRange(0, 1)]}, "Ranges need a numeric or time x axis"),
     ],
 )
-def test_validation(telemetry, change, message):
+def test_validation(with_list, change, message):
     with pytest.raises(ProcessingError, match=message):
-        run(telemetry, cfg(**change))
+        run(with_list, cfg(**change))
+
+
+@pytest.fixture
+def with_list(telemetry):
+    """The telemetry file plus a list column, which can be neither x nor y."""
+    path = telemetry.with_name("with_list.parquet")
+    df = pl.read_parquet(telemetry)
+    df.with_columns(tags=pl.Series([[1, 2]] * df.height)).write_parquet(path)
+    return path
 
 
 # -- CSV output ----------------------------------------------------------------------------

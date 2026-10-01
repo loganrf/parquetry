@@ -33,7 +33,9 @@ from ..durations import format_seconds, is_duration
 from ..processing import ProcessingError, parse_x_value, x_to_plot
 from .plot_area import RangeEntry, format_plot_x
 
-_KIND_LABEL = {"datetime": "time", "date": "date", "numeric": "number", "duration": "duration", "boolean": "bool"}
+_KIND_LABEL = {
+    "datetime": "time", "date": "date", "numeric": "number", "duration": "duration", "boolean": "bool", "text": "text",
+}
 
 
 class ParameterPanel(QGroupBox):
@@ -210,7 +212,8 @@ class AggregationPanel(QGroupBox):
             "Compact large files before plotting and exporting:\n"
             "• Every Nth row keeps one row out of N\n"
             "• Fixed interval buckets aggregates per time interval (e.g. 1 s, 1 min)\n"
-            "• Target number of points splits the x range into N equal buckets"
+            "• Target number of points splits the x range into N equal buckets\n"
+            "• One bucket per x value aggregates rows with the same x (e.g. per text category)"
         )
         self.method_combo.currentIndexChanged.connect(self._method_changed)
 
@@ -230,9 +233,11 @@ class AggregationPanel(QGroupBox):
         self.points_spin.valueChanged.connect(self.changed)
         self.param_stack = QStackedWidget()
         none_label = QLabel("All rows are used. Large files are reduced for display only.")
-        none_label.setWordWrap(True)
-        none_label.setStyleSheet("color: palette(placeholder-text);")
-        for widget in (none_label, self.n_spin, self.every_edit, self.points_spin):
+        per_value_label = QLabel("Rows with the same x value form one bucket.")
+        for label in (none_label, per_value_label):
+            label.setWordWrap(True)
+            label.setStyleSheet("color: palette(placeholder-text);")
+        for widget in (none_label, self.n_spin, self.every_edit, self.points_spin, per_value_label):
             self.param_stack.addWidget(widget)
 
         self.func_boxes: dict[str, QCheckBox] = {}
@@ -262,6 +267,12 @@ class AggregationPanel(QGroupBox):
     def set_x_kind(self, kind: str, is_duration: bool = False) -> None:
         self._x_kind = kind
         self._x_is_duration = is_duration
+        # Interval and equal-width buckets need numbers or times; text x aggregates per category.
+        model = self.method_combo.model()
+        for method in ("interval", "target_points"):
+            model.item(self.method_combo.findData(method)).setEnabled(kind != "category")
+        if kind == "category" and self.method_combo.currentData() in {"interval", "target_points"}:
+            self.method_combo.setCurrentIndex(self.method_combo.findData("per_value"))
         if kind == "datetime":
             self.every_edit.setPlaceholderText("duration, e.g. 500ms, 10s, 1m, 1h")
             self.every_edit.setToolTip("Bucket width as a duration: 500ms, 10s, 1m, 15m, 1h, 1d …")
@@ -314,7 +325,7 @@ class AggregationPanel(QGroupBox):
     def _method_changed(self, *_args, emit: bool = True) -> None:
         method = self.method_combo.currentData()
         self.param_stack.setCurrentIndex(AGG_METHODS.index(method))
-        self.funcs_widget.setEnabled(method in {"interval", "target_points"})
+        self.funcs_widget.setEnabled(method in {"interval", "target_points", "per_value"})
         if emit:
             self.changed.emit()
 
@@ -363,6 +374,10 @@ class RangePanel(QWidget):
     editRequested = Signal(int, object, object, object)  # index, lo, hi, label
 
     COLUMNS = ("#", "Label", "Start", "End", "Duration")
+    _HINT = (
+        "No ranges selected - exports include all data. Shift+drag on the plot, use range mode (R) "
+        "or “Add from view” to select time ranges for export."
+    )
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -376,7 +391,7 @@ class RangePanel(QWidget):
             "applied to other files recorded at different times."
         )
         self.mode_combo.currentIndexChanged.connect(self.modeChanged)
-        add = QPushButton("Add from view")
+        self.add_button = add = QPushButton("Add from view")
         add.setToolTip("Add a range covering the middle of the visible area")
         add.clicked.connect(self.addRequested)
         self.remove_button = QPushButton("Remove")
@@ -409,10 +424,7 @@ class RangePanel(QWidget):
         self.table.setColumnWidth(3, 210)
         self.table.itemChanged.connect(self._item_changed)
         self.table.cellDoubleClicked.connect(lambda row, col: col == 0 and self.zoomRequested.emit(row))
-        self.hint = QLabel(
-            "No ranges selected - exports include all data. Shift+drag on the plot, use range mode (R) "
-            "or “Add from view” to select time ranges for export."
-        )
+        self.hint = QLabel(self._HINT)
         self.hint.setWordWrap(True)
         self.hint.setStyleSheet("color: palette(placeholder-text);")
 
@@ -437,6 +449,10 @@ class RangePanel(QWidget):
         self._kind, self._tz = kind, tz
         suffix = " (UTC)" if kind == "datetime" and tz else ""
         self.table.setHorizontalHeaderLabels(["#", "Label", f"Start{suffix}", f"End{suffix}", "Duration"])
+        allowed = kind != "category"
+        self.mode_combo.setEnabled(allowed)
+        self.add_button.setEnabled(allowed)
+        self.hint.setText(self._HINT if allowed else "Ranges need a numeric or time x axis; the x axis is text.")
 
     def refresh(self, ranges: list[RangeEntry]) -> None:
         self._updating = True

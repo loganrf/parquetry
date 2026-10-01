@@ -31,9 +31,9 @@ Installed-Size: ${installed_size}
 Maintainer: Parquetry developers <parquetry@users.noreply.github.com>
 Homepage: https://github.com/loganrf/parquetry
 Depends: libc6 (>= 2.35), libegl1, libgl1, libfontconfig1, libfreetype6, libxkbcommon0, libxkbcommon-x11-0, libdbus-1-3, libx11-xcb1, libxcb-cursor0
-Description: Explore, aggregate and export Parquet files
+Description: Explore, aggregate and export Parquet and CSV files
  Parquetry is a desktop application and command line tool for exploring large
- Parquet files: plot parameters against time, compact data with aggregation,
+ Parquet and CSV files: plot parameters against time, compact data with aggregation,
  select time ranges and export them to CSV, and save the processing settings
  for automated batch processing with the "parquetry export" command.
 CONTROL

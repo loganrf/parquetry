@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "parquetry"
 dynamic = ["version"]
-description = "Explore, aggregate and export large Parquet files - desktop UI plus a scriptable CLI."
+description = "Explore, aggregate and export large Parquet and CSV files - desktop UI plus a scriptable CLI."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

@@ -1,4 +1,4 @@
-"""Start page: browse the file system for a Parquet file and preview it."""
+"""Start page: browse the file system for a Parquet or CSV file and preview it."""
 
 from __future__ import annotations
 
@@ -30,12 +30,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..dataset import PARQUET_SUFFIXES, DatasetInfo, format_bytes, inspect_parquet, is_parquet_path
+from ..dataset import DATA_SUFFIXES, DatasetInfo, format_bytes, inspect_file, is_data_path
 from . import workers
 
-NAME_FILTERS = [f"*{suffix}" for suffix in PARQUET_SUFFIXES]
+NAME_FILTERS = [f"*{suffix}" for suffix in DATA_SUFFIXES]
+FILE_DIALOG_FILTERS = (
+    "Data files (*.parquet *.parq *.pq *.csv *.tsv);;Parquet files (*.parquet *.parq *.pq);;"
+    "CSV files (*.csv *.tsv);;All files (*)"
+)
 MAX_RECENT = 12
-_ROLE = {"datetime": "time", "date": "date", "numeric": "numeric", "boolean": "boolean", "duration": "duration"}
+_ROLE = {
+    "datetime": "time", "date": "date", "numeric": "numeric", "boolean": "boolean", "duration": "duration",
+    "text": "text",
+}
 
 
 def recent_files(settings: QSettings) -> list[str]:
@@ -61,7 +68,7 @@ class FileBrowserPage(QWidget):
         self._generation = 0
         self._selected: Path | None = None
 
-        title = QLabel("<h2 style='margin:0'>Open a Parquet file</h2>")
+        title = QLabel("<h2 style='margin:0'>Open a Parquet or CSV file</h2>")
         subtitle = QLabel("Double-click a file to explore it, or drop one onto the window.")
         subtitle.setStyleSheet("color: palette(placeholder-text);")
 
@@ -129,7 +136,7 @@ class FileBrowserPage(QWidget):
         self.preview_title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.summary = QFormLayout()
         self.summary_labels: dict[str, QLabel] = {}
-        for key in ("Size", "Rows", "Columns", "Row groups", "Compression", "Created by", "Modified"):
+        for key in ("Format", "Size", "Rows", "Columns", "Row groups", "Compression", "Created by", "Modified"):
             label = QLabel()
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             self.summary_labels[key] = label
@@ -240,9 +247,7 @@ class FileBrowserPage(QWidget):
         self.path_edit.setStyleSheet("")
 
     def _browse(self) -> None:
-        filename, _ = QFileDialog.getOpenFileName(
-            self, "Open Parquet file", str(self.current_directory()), "Parquet files (*.parquet *.parq *.pq);;All files (*)"
-        )
+        filename, _ = QFileDialog.getOpenFileName(self, "Open data file", str(self.current_directory()), FILE_DIALOG_FILTERS)
         if filename:
             self._open(filename)
 
@@ -275,10 +280,11 @@ class FileBrowserPage(QWidget):
         self._clear_preview()
         self._selected = path
         self.preview_title.setText(f"<b>{path.name}</b><br><span style='color:gray'>Reading metadata…</span>")
-        if not is_parquet_path(path) and not self.show_all.isChecked():
+        if not is_data_path(path) and not self.show_all.isChecked():
             return
         workers.submit(
-            lambda: inspect_parquet(path),
+            # Only the start of a CSV file is checked: the preview must stay quick for large files.
+            lambda: inspect_file(path, verify=False),
             on_done=lambda info: self._preview_done(generation, info),
             on_error=lambda exc: self._preview_failed(generation, path, exc),
         )
@@ -289,6 +295,7 @@ class FileBrowserPage(QWidget):
         self.preview_title.setText(f"<b>{info.path.name}</b><br><span style='color:gray'>{info.path.parent}</span>")
         modified = dt.datetime.fromtimestamp(info.mtime).strftime("%Y-%m-%d %H:%M")
         values = {
+            "Format": info.format_label,
             "Size": format_bytes(info.size_bytes),
             "Rows": f"{info.num_rows:,}",
             "Columns": str(len(info.columns)),

@@ -1,4 +1,4 @@
-"""Batch export: apply one configuration to many Parquet files."""
+"""Batch export: apply one configuration to many Parquet or CSV files."""
 
 from __future__ import annotations
 
@@ -30,9 +30,10 @@ from PySide6.QtWidgets import (
 
 from ..cli import command_line
 from ..config import ConfigError, ProcessingConfig
-from ..dataset import PARQUET_SUFFIXES
-from ..processing import batch_export, find_inputs
+from ..dataset import DATA_SUFFIXES
+from ..processing import batch_export, exclude_outputs, find_inputs
 from . import workers
+from .file_browser import FILE_DIALOG_FILTERS
 
 
 def describe_config(cfg: ProcessingConfig) -> str:
@@ -202,13 +203,13 @@ class BatchDialog(QDialog):
     def _add_paths(self, paths) -> None:
         existing = {self.inputs.item(i).text() for i in range(self.inputs.count())}
         for path in find_inputs([str(p) for p in paths], recursive=self.recursive.isChecked()):
-            if str(path) not in existing and path.suffix.lower() in PARQUET_SUFFIXES:
+            if str(path) not in existing and path.suffix.lower() in DATA_SUFFIXES:
                 self.inputs.addItem(str(path))
                 existing.add(str(path))
 
     def _add_files(self) -> None:
         start = self.settings.value("browser/last_dir", str(Path.home()))
-        files, _ = QFileDialog.getOpenFileNames(self, "Add Parquet files", start, "Parquet files (*.parquet *.parq *.pq);;All files (*)")
+        files, _ = QFileDialog.getOpenFileNames(self, "Add data files", start, FILE_DIALOG_FILTERS)
         self._add_paths(files)
 
     def _add_folder(self) -> None:
@@ -218,7 +219,7 @@ class BatchDialog(QDialog):
             before = self.inputs.count()
             self._add_paths([folder])
             if self.inputs.count() == before:
-                QMessageBox.information(self, "Add folder", "No Parquet files found in that folder.")
+                QMessageBox.information(self, "Add folder", "No Parquet or CSV files found in that folder.")
 
     def _remove_selected(self) -> None:
         for item in self.inputs.selectedItems():
@@ -257,6 +258,12 @@ class BatchDialog(QDialog):
         template = self.output_edit.text().strip() or None
         if template and len(inputs) > 1 and not any(p in template for p in ("{stem}", "{name}", "{parent}")):
             QMessageBox.warning(self, "Batch export", "With several inputs the file name must contain {stem}, {name} or {parent}.")
+            return
+        inputs, own_outputs = exclude_outputs(inputs, cfg, template)
+        for path in own_outputs:
+            self.log.appendPlainText(f"• {path.name}: skipped (this export writes it)")
+        if not inputs:
+            self.log.appendPlainText("Nothing left to export.")
             return
         self._cancel.clear()
         self._set_running(True)

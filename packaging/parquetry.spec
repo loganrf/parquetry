@@ -126,7 +126,13 @@ if sys.platform == "darwin":
                     "CFBundleTypeRole": "Viewer",
                     "LSHandlerRank": "Alternate",
                     "CFBundleTypeExtensions": ["parquet", "parq", "pq"],
-                }
+                },
+                {
+                    "CFBundleTypeName": "CSV file",
+                    "CFBundleTypeRole": "Viewer",
+                    "LSHandlerRank": "Alternate",
+                    "CFBundleTypeExtensions": ["csv", "tsv"],
+                },
             ],
         },
     )
