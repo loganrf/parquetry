@@ -96,8 +96,11 @@ parquetry flight.parquet                         # or open a file directly
    window or use *File → Open recent*.
 2. **Choose parameters.** Pick the **X axis** (a timestamp column is chosen
    automatically) and tick the **Y parameters**. The filter box helps when a file
-   has hundreds of columns. Double-click a parameter to show only that one.
-   Text parameters get a plot of their own, also when the others are overlaid.
+   has hundreds of columns, and *Sort* (or a click on a column header) orders the
+   list by name or type; *File order* restores the file's column order. Plots and
+   exports show parameters in the order you tick them. Double-click a parameter
+   to show only that one. Text parameters get a plot of their own, also when the
+   others are overlaid.
 3. **Aggregate** (optional). Choose a method and the functions to apply. If you
    choose both *min* and *max*, they are drawn as a shaded band. The plot and
    exports both use this aggregation. With a text x axis, *One bucket per x

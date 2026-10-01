@@ -84,6 +84,8 @@ class ExplorerPage(QWidget):
         self.file_label.setTextFormat(Qt.TextFormat.RichText)
         self.file_label.setWordWrap(True)
         self.params = ParameterPanel()
+        self.params.set_sort(settings.value("parameters/sort", "file"), settings.value("parameters/reverse", False, type=bool))
+        self.params.sortChanged.connect(self._sort_changed)
         self.params.xChanged.connect(self._x_changed)
         self.params.yChanged.connect(self.schedule_update)
         self.aggregation = AggregationPanel()
@@ -248,6 +250,11 @@ class ExplorerPage(QWidget):
     def _set_show_points(self, on: bool) -> None:
         self.settings.setValue("plot/points", on)
         self.plot.set_show_points(on)
+
+    def _sort_changed(self) -> None:
+        key, reverse = self.params.sort_order()
+        self.settings.setValue("parameters/sort", key)
+        self.settings.setValue("parameters/reverse", reverse)
 
     def update_actions(self) -> None:
         """Enable the actions that suit the x axis and the plot (while the page is shown)."""

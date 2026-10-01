@@ -20,8 +20,10 @@ from parquetry.processing import PlotData, PlotSeries, load_plot_data  # noqa: E
 from parquetry.ui import workers  # noqa: E402
 from parquetry.ui.app import create_app  # noqa: E402
 from parquetry.ui.batch_dialog import BatchDialog  # noqa: E402
+from parquetry.ui.explorer import ExplorerPage  # noqa: E402
 from parquetry.ui.export_dialog import ExportDialog, path_to_template  # noqa: E402
 from parquetry.ui.main_window import MainWindow  # noqa: E402
+from parquetry.ui.panels import natural_key  # noqa: E402
 from parquetry.ui.plot_area import CategoryAxis, PlotArea  # noqa: E402
 
 from .conftest import START  # noqa: E402
@@ -365,3 +367,38 @@ def test_batch_dialog_skips_its_own_outputs(qtbot, settings, tmp_path):
     idle(qtbot)
     log = dialog.log.toPlainText()
     assert "a_export.csv: skipped" in log and "2 succeeded, 0 failed" in log
+
+
+def test_parameter_sorting(explorer, window, telemetry, settings, qtbot):
+    params = explorer.params
+    tree = params.tree
+
+    def names(hidden=None):
+        items = [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
+        return [item.text(0) for item in items if hidden is None or item.isHidden() == hidden]
+
+    assert params.sort_order() == ("file", False) and names() == ["speed", "temp", "rpm", "on", "label"]
+    params.filter_edit.setText("e")
+    params.sort_combo.setCurrentIndex(params.sort_combo.findData("name"))
+    assert names() == ["label", "on", "rpm", "speed", "temp"]
+    assert names(hidden=True) == ["on", "rpm"]  # the filter still applies
+    params.reverse_button.setChecked(True)
+    assert names() == ["temp", "speed", "rpm", "on", "label"]
+    tree.header().sectionClicked.emit(1)  # sort by the type column
+    assert params.sort_order() == ("type", False)
+    assert names() == ["on", "speed", "temp", "rpm", "label"]  # Boolean, Float64, Float64, Int32, String
+    tree.header().sectionClicked.emit(1)  # again: reversed
+    assert names() == ["label", "rpm", "temp", "speed", "on"]
+    # Ticks survive sorting, and plots keep the order in which parameters were ticked.
+    assert params.selected_y() == ["speed", "temp"]
+    assert (settings.value("parameters/sort"), settings.value("parameters/reverse", type=bool)) == ("type", True)
+    window.open_file(telemetry)  # another file keeps the order
+    idle(qtbot)
+    assert names() == ["label", "rpm", "temp", "speed", "on"]
+    page = ExplorerPage(settings)
+    qtbot.addWidget(page)
+    assert page.params.sort_order() == ("type", True)
+
+
+def test_natural_key():
+    assert sorted(["ch10", "Ch2", "ch1", "b"], key=natural_key) == ["b", "ch1", "Ch2", "ch10"]
