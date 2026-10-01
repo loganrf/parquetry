@@ -9,7 +9,7 @@ from .config import AggregationConfig, CsvOptions, OutputOptions, ProcessingConf
 from .dataset import ROW_INDEX, ColumnInfo, DatasetInfo, inspect_parquet
 from .processing import ExportResult, ProcessingError, export_file, load_plot_data, preview_csv
 
-__version__ = "0.1.0"
+__version__ = "0.1.2"
 
 __all__ = [
     "ROW_INDEX",

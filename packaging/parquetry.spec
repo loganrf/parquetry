@@ -115,6 +115,10 @@ if sys.platform == "darwin":
             "CFBundleDisplayName": "Parquetry",
             "CFBundleShortVersionString": VERSION,
             "NSHighResolutionCapable": True,
+            # BUNDLE takes `console` from the last EXE in COLLECT (the console CLI)
+            # and then marks the app background-only: no Dock icon, no menu bar, and
+            # keyboard input keeps going to the previously active app.
+            "LSBackgroundOnly": False,
             "LSMinimumSystemVersion": "11.0",
             "CFBundleDocumentTypes": [
                 {
