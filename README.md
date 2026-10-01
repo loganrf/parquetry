@@ -243,9 +243,9 @@ builds and smoke-tests a Linux bundle. To publish a release:
 `.github/workflows/release.yml` checks that the tag matches the version. It then
 builds the wheel and sdist, uses PyInstaller to build the Windows, macOS
 (arm64 and x86-64) and Linux bundles, runs `packaging/smoke_test.py` against
-each bundle (the CLI end to end and the UI headless), packages them with
-`packaging/package.py`, and publishes everything with checksums as a GitHub
-release. Tags with a hyphen (`v0.2.0-rc1`) become pre-releases. Starting the
+each bundle (the CLI end to end, the UI headless and, on macOS, the app's
+`Info.plist`), packages them with `packaging/package.py`, and publishes
+everything with checksums as a GitHub release. Tags with a hyphen (`v0.2.0-rc1`) become pre-releases. Starting the
 workflow manually builds all artifacts without publishing.
 
 The macOS app and disk images are signed with a Developer ID certificate and
