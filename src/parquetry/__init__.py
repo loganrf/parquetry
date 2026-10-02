@@ -5,11 +5,11 @@ The package is split into a UI-independent core (``dataset``, ``config``,
 application in :mod:`parquetry.ui`.
 """
 
-from .config import AggregationConfig, CsvOptions, OutputOptions, ProcessingConfig, TimeRange
+from .config import AggregationConfig, CsvOptions, OutputOptions, ProcessingConfig, Scaling, TimeRange
 from .dataset import ROW_INDEX, ColumnInfo, DatasetInfo, inspect_file, inspect_parquet
 from .processing import ExportResult, ProcessingError, export_file, load_plot_data, load_table_data, preview_csv
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "ROW_INDEX",
@@ -21,6 +21,7 @@ __all__ = [
     "OutputOptions",
     "ProcessingConfig",
     "ProcessingError",
+    "Scaling",
     "TimeRange",
     "__version__",
     "export_file",

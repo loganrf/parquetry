@@ -83,6 +83,8 @@ class MainWindow(QMainWindow):
         file_menu.addAction(ex.act_save_config)
         file_menu.addSeparator()
         file_menu.addAction(ex.act_export)
+        file_menu.addAction(ex.act_export_image)
+        file_menu.addAction(ex.act_copy_image)
         self.act_batch = QAction("&Batch export…", self)
         self.act_batch.setShortcut(QKeySequence("Ctrl+B"))
         self.act_batch.setStatusTip("Apply a configuration to many Parquet or CSV files")
@@ -97,6 +99,8 @@ class MainWindow(QMainWindow):
         view_menu = self.menuBar().addMenu("&View")
         for action in (ex.act_stacked, ex.act_points, ex.act_auto_y, ex.act_reset, ex.act_detail):
             view_menu.addAction(action)
+        view_menu.addSeparator()
+        view_menu.addAction(ex.act_plot_settings)
         ranges_menu = self.menuBar().addMenu("&Ranges")
         for action in (ex.act_select, ex.act_add_range, ex.act_zoom_ranges):
             ranges_menu.addAction(action)
@@ -115,6 +119,7 @@ class MainWindow(QMainWindow):
         self._file_actions = [
             ex.act_load_config, ex.act_save_config, ex.act_export, ex.act_select, ex.act_add_range,
             ex.act_zoom_ranges, ex.act_stacked, ex.act_points, ex.act_auto_y, ex.act_reset, clear,
+            ex.act_plot_settings, ex.act_export_image, ex.act_copy_image,
         ]
 
     def _fill_recent_menu(self) -> None:

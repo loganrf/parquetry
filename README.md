@@ -30,7 +30,15 @@ similar files.
   `1m`, `1h`, …), a target number of buckets or one bucket per x value (per
   category), with mean, min, max, median, first, last, sum, count and std.
 - **Interactive plot:** stacked or overlaid, optional point markers, crosshair
-  readout, scroll to zoom, and drag to select time ranges.
+  readout, scroll to zoom, and drag to select time ranges, each highlighted in
+  a colour of your choice.
+- **Plot settings:** colours and labels per parameter, line width, point size,
+  grid, legend, title, light or dark colours, and exact x and y axis ranges.
+- **Image export:** save the plots as PNG, JPEG, SVG or PDF at any size and
+  resolution, or copy them to the clipboard.
+- **Scale and offset** any number or time column (`value × scale + offset`) to
+  convert units or correct a sensor; plots, ranges, aggregation and exports all
+  use the converted values.
 - **CSV export:** separator, time format (ISO, custom strftime, epoch, elapsed
   seconds), precision, decimal comma, missing values, quoting, line endings,
   BOM, column renames, one file per range, all with a live preview.
@@ -108,7 +116,15 @@ parquetry flight.parquet                         # or open a file directly
    choose both *min* and *max*, they are drawn as a shaded band. The plot and
    exports both use this aggregation. With a text x axis, *One bucket per x
    value* aggregates per category, for example the mean revenue per region.
-4. **Explore the plot.** Scroll to zoom and drag to pan. *Auto Y* fits the y axis
+4. **Scale values** (optional). The **Scaling** tab under the plot lists the x
+   column and the ticked parameters. Each value becomes *value × scale + offset*,
+   for example a scale of `3.28084` for metres to feet, `1/3.6` for km/h to m/s,
+   or `9/5` with an offset of `32` for °C to °F (simple arithmetic is allowed).
+   Time columns can only be shifted: give the offset in seconds or as a
+   duration such as `2h` or `-30m`. Plots, the data table, ranges, aggregation
+   and exports all use the converted values, and ranges move along when the x
+   scaling changes. Another file opens without scaling.
+5. **Explore the plot.** Scroll to zoom and drag to pan. *Auto Y* fits the y axis
    to the visible data, *Stacked* switches between one plot per parameter and a
    single overlay, and *Points* marks every data point, so values surrounded by
    gaps (nulls), which no line can connect, stay visible. The readout under the
@@ -117,21 +133,38 @@ parquetry flight.parquet                         # or open a file directly
    that region. The **Data** tab under the plot lists the rows behind the
    visible part of the plot (the first 50,000) and follows the plot as you zoom
    and pan. Ctrl+C copies the selected cells.
-5. **Select ranges.** **Shift+drag** on the plot, or turn on **Range mode (R)**
+6. **Select ranges.** **Shift+drag** on the plot, or turn on **Range mode (R)**
    and drag, or press **Add range (A)**. Ranges can be moved and resized on the
    plot, edited or labelled in the table below it, and removed from the table or
-   with a right-click. *Save as* chooses whether a saved configuration stores
-   them as absolute times or as offsets from the start of the data. Offsets can
-   be applied to other recordings. Ranges need a numeric or time x axis.
-6. **Export CSV (Ctrl+E).** Choose the output file, all data or only the
+   with a right-click. The *Colour* column, or *Set colour…* in a range's
+   right-click menu, gives a range its own highlight colour; the others use the
+   range colour of the plot settings. *Save as* chooses whether a saved
+   configuration stores them as absolute times or as offsets from the start of
+   the data. Offsets can be applied to other recordings. Ranges need a numeric
+   or time x axis.
+7. **Adjust the look** with **Plot settings (Ctrl+Shift+P)**, also in the plot's
+   right-click menu: a title, light or dark colours whatever the app looks like,
+   line width, point size, grid, legend and the range colour and opacity; a
+   colour and a label (for the axis and the legend) per parameter; and exact x
+   and y axis ranges. A fixed y range stays while you zoom along x, and *Reset
+   zoom* returns every plot to automatic ranges. Colours and labels are
+   remembered by column name, also for other files.
+8. **Export an image (Ctrl+Shift+E)** as PNG, JPEG, SVG or PDF. The size sets
+   the layout (a wider image shows more detail at the same text size) and the
+   resolution multiplies the pixels of PNG and JPEG images, so 2× gives sharp
+   images for slides and documents. PNG, SVG and PDF can have a transparent
+   background. **Copy plot image (Ctrl+Shift+C)** puts the plots on the
+   clipboard instead.
+9. **Export CSV (Ctrl+E).** Choose the output file, all data or only the
    selected ranges (optionally one file per range), whether to use the
    aggregation, column headers and the CSV format. The preview updates as you
    change settings.
-7. **Save the configuration (Ctrl+S)** to reuse it. *Copy CLI command* in the
-   export dialog copies an equivalent `parquetry export` command.
-   **File → Batch export (Ctrl+B)** applies the current settings, or a saved
-   configuration, to a list of files or folders. **File → Load config (Ctrl+L)**
-   applies a saved configuration to the open file.
+10. **Save the configuration (Ctrl+S)** to reuse it, scaling and range colours
+    included. *Copy CLI command* in the export dialog copies an equivalent
+    `parquetry export` command. **File → Batch export (Ctrl+B)** applies the
+    current settings, or a saved configuration, to a list of files or folders.
+    **File → Load config (Ctrl+L)** applies a saved configuration to the open
+    file.
 
 | Shortcut | Action |
 |---|---|
@@ -144,7 +177,9 @@ parquetry flight.parquet                         # or open a file directly
 | Y | Toggle automatic y scaling |
 | D | Load full detail for the visible area |
 | Ctrl+0 | Reset zoom |
-| Ctrl+E / Ctrl+S / Ctrl+L / Ctrl+B | Export, save config, load config, batch export |
+| Ctrl+Shift+P | Plot settings |
+| Ctrl+Shift+E / Ctrl+Shift+C | Export the plots as an image, copy them to the clipboard |
+| Ctrl+E / Ctrl+S / Ctrl+L / Ctrl+B | Export CSV, save config, load config, batch export |
 
 ## Command line
 
@@ -178,11 +213,16 @@ parquetry export flight.parquet --y altitude_m --n 100 --dry-run --save-config e
 
 # CSV input with a text x axis: mean and maximum revenue per region
 parquetry export sales.csv --x region --y revenue --agg per_value --func mean max -o -
+
+# Feet instead of metres, km/h instead of m/s, and times two hours later
+parquetry export flight.parquet --y altitude_m airspeed_mps --scale altitude_m=3.28084 \
+    --scale airspeed_mps=3.6 --offset timestamp=2h
 ```
 
 | Group | Options |
 |---|---|
 | Data | `--x COL`, `--y COL...`, `--range START END [LABEL]` (repeatable, `-` for an open end), `--range-mode absolute\|relative`, `--all-data`, `--split-ranges`, `--no-sort` |
+| Scaling | `--scale COL=FACTOR` (e.g. `speed=1/3.6`), `--offset COL=VALUE` (seconds or a duration such as `2h` for times); both repeatable |
 | Aggregation | `--agg none\|every_nth\|interval\|target_points\|per_value`, `--n N`, `--every 10s\|1m\|<number>`, `--points N`, `--func mean min max median first last sum count std` |
 | CSV | `--sep`, `--time-format iso\|custom\|epoch_s\|epoch_ms\|elapsed_s`, `--datetime-format`, `--float-precision`, `--decimal-comma`, `--null-value`, `--quote-style`, `--no-header`, `--bom`, `--crlf`, `--rename OLD=NEW` |
 | Run | `-o PATH\|DIR\|-`, `-r`, `--save-config PATH`, `--dry-run`, `--skip-existing`, `--fail-fast`, `-q` |
@@ -202,9 +242,13 @@ Configurations are plain JSON. Every section except `x` and `y` is optional:
   "version": 1,
   "x": "timestamp",
   "y": ["altitude_m", "airspeed_mps"],
+  "scaling": {
+    "altitude_m": {"scale": 3.28084},
+    "timestamp": {"offset": "2h"}
+  },
   "range_mode": "relative",
   "ranges": [
-    {"start": 0, "end": 600, "label": "takeoff"},
+    {"start": 0, "end": 600, "label": "takeoff", "color": "#2ca02c"},
     {"start": "1h", "end": null}
   ],
   "aggregation": {"method": "interval", "every": "1s", "functions": ["mean", "max"]},
@@ -226,9 +270,16 @@ Configurations are plain JSON. Every section except `x` and `y` is optional:
 }
 ```
 
-- **Ranges:** absolute ranges use ISO 8601 times (or numbers for a numeric x).
-  Relative ranges are offsets from the first x value. For time columns they are
-  seconds or durations like `"90s"` or `"1h30m"`. `null` leaves an end open.
+- **Scaling:** `value × scale + offset` per column (x or y), applied before
+  ranges and aggregation. `scale` defaults to 1 and `offset` to 0; time columns
+  take only an `offset`, in seconds or as a duration such as `"2h"` or `"-30s"`.
+  Text and boolean columns cannot be scaled. Columns that are not exported are
+  ignored, so one configuration can hold the conversions for many parameters.
+- **Ranges:** absolute ranges use ISO 8601 times (or numbers for a numeric x),
+  in the units after scaling. Relative ranges are offsets from the first x
+  value. For time columns they are seconds or durations like `"90s"` or
+  `"1h30m"`. `null` leaves an end open. `color` (`#rrggbb` or a colour name) is
+  the highlight on the plot; exports ignore it.
 - **Aggregation methods:** `none`, `every_nth` (`n`), `interval` (`every`: a
   duration for time axes or a bucket width for numeric axes; buckets are aligned
   to calendar/epoch boundaries), `target_points` (`points` equal-width
@@ -299,14 +350,14 @@ CI (`.github/workflows/ci.yml`) runs the tests on Linux, Windows and macOS and
 builds and smoke-tests a Linux bundle. To publish a release:
 
 1. Update `__version__` in `src/parquetry/__init__.py`.
-2. Tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
+2. Tag and push: `git tag v0.3.0 && git push origin v0.3.0`.
 
 `.github/workflows/release.yml` checks that the tag matches the version. It then
 builds the wheel and sdist, uses PyInstaller to build the Windows, macOS
 (arm64 and x86-64) and Linux bundles, runs `packaging/smoke_test.py` against
 each bundle (the CLI end to end, the UI headless and, on macOS, the app's
 `Info.plist`), packages them with `packaging/package.py`, and publishes
-everything with checksums as a GitHub release. Tags with a hyphen (`v0.2.0-rc1`) become pre-releases. Starting the
+everything with checksums as a GitHub release. Tags with a hyphen (`v0.3.0-rc1`) become pre-releases. Starting the
 workflow manually builds all artifacts without publishing.
 
 The macOS app and disk images are signed with a Developer ID certificate and

@@ -11,6 +11,7 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from . import __version__
@@ -22,10 +23,12 @@ from .config import (
     TIME_FORMATS,
     ConfigError,
     ProcessingConfig,
+    Scaling,
     TimeRange,
+    parse_number,
 )
 from .dataset import ROW_INDEX, ROW_INDEX_LABEL, format_bytes, inspect_file
-from .durations import format_seconds
+from .durations import format_seconds, is_duration
 
 COMMANDS = ("ui", "info", "export", "sample")
 
@@ -43,6 +46,10 @@ examples:
 
   # CSV input; mean and maximum per category of a text column
   parquetry export sales.csv --x region --y revenue --agg per_value --func mean max
+
+  # feet instead of metres, km/h instead of m/s, and times two hours later
+  parquetry export flight.parquet --y altitude_m airspeed_mps --scale altitude_m=3.28084 \
+      --scale airspeed_mps=3.6 --offset timestamp=2h
 
 directories are searched for Parquet (.parquet, .parq, .pq) and CSV (.csv, .tsv)
 files. Files that the export itself writes (e.g. results of an earlier run in
@@ -75,6 +82,31 @@ def _rename(text: str) -> tuple[str, str]:
         raise argparse.ArgumentTypeError("use OLD=NEW")
     old, new = text.split("=", 1)
     return old, new
+
+
+def _scale(text: str) -> tuple[str, float]:
+    column, _, value = text.rpartition("=")
+    if not column:
+        raise argparse.ArgumentTypeError("use COLUMN=FACTOR, e.g. altitude_m=3.28084 or speed=1/3.6")
+    try:
+        factor = parse_number(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    if factor == 0:
+        raise argparse.ArgumentTypeError("the factor must not be zero")
+    return column, factor
+
+
+def _offset(text: str) -> tuple[str, float | str]:
+    column, _, value = text.rpartition("=")
+    if not column:
+        raise argparse.ArgumentTypeError("use COLUMN=VALUE, e.g. temp_c=32 or timestamp=2h")
+    try:
+        return column, parse_number(value)
+    except ValueError:
+        if is_duration(value.strip().lstrip("-")):
+            return column, value.strip()
+        raise argparse.ArgumentTypeError(f"{value!r} is neither a number nor a duration such as 2h") from None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -125,6 +157,16 @@ def build_parser() -> argparse.ArgumentParser:
     sel.add_argument("--all-data", action="store_true", help="ignore ranges from the configuration")
     sel.add_argument("--split-ranges", action="store_true", default=None, help="write one file per range")
     sel.add_argument("--no-sort", action="store_true", help="skip sorting by x (only for files already sorted)")
+
+    scl = exp.add_argument_group("scaling (value * FACTOR + OFFSET, before ranges and aggregation)")
+    scl.add_argument(
+        "--scale", type=_scale, action="append", metavar="COL=FACTOR",
+        help="multiply a column by FACTOR (repeatable), e.g. altitude_m=3.28084 or speed=1/3.6",
+    )
+    scl.add_argument(
+        "--offset", type=_offset, action="append", metavar="COL=VALUE",
+        help="add VALUE to a column (repeatable); times are shifted by seconds or a duration such as timestamp=2h",
+    )
 
     agg = exp.add_argument_group("aggregation")
     agg.add_argument("--agg", type=_agg_method, metavar="METHOD", help=f"one of {', '.join(AGG_METHODS)}")
@@ -347,6 +389,10 @@ def config_from_args(args: argparse.Namespace) -> ProcessingConfig:
         cfg.output.split_ranges = True
     if args.no_sort:
         cfg.sort = False
+    for column, factor in args.scale or []:
+        cfg.scaling[column] = replace(cfg.scaling.get(column) or Scaling(), scale=factor)
+    for column, offset in args.offset or []:
+        cfg.scaling[column] = replace(cfg.scaling.get(column) or Scaling(), offset=offset)
     agg = cfg.aggregation
     if args.agg:
         agg.method = args.agg
@@ -398,6 +444,12 @@ def config_to_args(cfg: ProcessingConfig) -> list[str]:
     """Command line options equivalent to *cfg* (inverse of :func:`config_from_args`)."""
     default = ProcessingConfig()
     args = ["--x", cfg.x, "--y", *cfg.y]
+    for column, scaling in cfg.scaling.items():
+        if scaling.scale != 1:
+            args += ["--scale", f"{column}={_number(scaling.scale)}"]
+        if scaling.offset_value != 0:
+            offset = scaling.offset if isinstance(scaling.offset, str) else _number(scaling.offset)
+            args += ["--offset", f"{column}={offset}"]
     for rng in cfg.ranges:
         args += ["--range", _bound_arg(rng.start), _bound_arg(rng.end), *([rng.label] if rng.label else [])]
     if cfg.range_mode != default.range_mode:
@@ -445,6 +497,12 @@ def config_to_args(cfg: ProcessingConfig) -> list[str]:
 
 def _bound_arg(value) -> str:
     return "-" if value is None else str(value)
+
+
+def _number(value: float) -> str:
+    """Shortest text that reads back as the same number."""
+    value = float(value)
+    return str(int(value)) if value.is_integer() and abs(value) < 1e15 else repr(value)
 
 
 def command_line(inputs: Sequence[str], cfg: ProcessingConfig | None = None, config_path: str | None = None,

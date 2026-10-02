@@ -38,6 +38,9 @@ from .file_browser import FILE_DIALOG_FILTERS
 
 def describe_config(cfg: ProcessingConfig) -> str:
     parts = [f"x = {cfg.x}", f"{len(cfg.y)} parameter(s): {', '.join(cfg.y[:6])}{' …' if len(cfg.y) > 6 else ''}"]
+    scaled = [f"{c} {cfg.scaling_for(c).describe()}" for c in cfg.scaling if cfg.scaling_for(c) is not None]
+    if scaled:
+        parts.append(f"scaled: {', '.join(scaled[:4])}{' …' if len(scaled) > 4 else ''}")
     parts.append(cfg.aggregation.describe())
     if cfg.ranges:
         parts.append(f"{len(cfg.ranges)} {cfg.range_mode} range(s)")

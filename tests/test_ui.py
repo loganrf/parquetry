@@ -11,10 +11,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 pytest.importorskip("pyqtgraph")
 
-from PySide6.QtCore import QSettings, Qt  # noqa: E402
-from PySide6.QtWidgets import QMessageBox  # noqa: E402
+from PySide6.QtCore import QSettings, QSize, Qt  # noqa: E402
+from PySide6.QtGui import QGuiApplication, QImage  # noqa: E402
+from PySide6.QtWidgets import QLabel, QMessageBox  # noqa: E402
 
-from parquetry.config import AggregationConfig, ProcessingConfig, TimeRange  # noqa: E402
+from parquetry.config import AggregationConfig, ProcessingConfig, Scaling, TimeRange  # noqa: E402
 from parquetry.dataset import ROW_INDEX  # noqa: E402
 from parquetry.processing import PlotData, PlotSeries, load_plot_data  # noqa: E402
 from parquetry.ui import workers  # noqa: E402
@@ -22,9 +23,13 @@ from parquetry.ui.app import create_app  # noqa: E402
 from parquetry.ui.batch_dialog import BatchDialog  # noqa: E402
 from parquetry.ui.explorer import ExplorerPage  # noqa: E402
 from parquetry.ui.export_dialog import ExportDialog, path_to_template  # noqa: E402
+from parquetry.ui.image_export import ImageExportDialog  # noqa: E402
 from parquetry.ui.main_window import MainWindow  # noqa: E402
 from parquetry.ui.panels import natural_key  # noqa: E402
 from parquetry.ui.plot_area import CategoryAxis, PlotArea  # noqa: E402
+from parquetry.ui.plot_settings import PlotSettingsDialog  # noqa: E402
+from parquetry.ui.theme import PlotStyle, load_style  # noqa: E402
+from parquetry.ui.widgets import ColorButton  # noqa: E402
 
 from .conftest import START  # noqa: E402
 
@@ -112,12 +117,12 @@ def test_ranges_absolute_and_relative(explorer):
 
 def test_edit_range_in_table(explorer):
     explorer.plot.add_range(EPOCH_START + 10, EPOCH_START + 20)
-    explorer.ranges_panel.table.item(0, 3).setText("2024-01-01 00:00:30")
-    explorer.ranges_panel.table.item(0, 1).setText("climb")
+    explorer.ranges_panel.table.item(0, 4).setText("2024-01-01 00:00:30")
+    explorer.ranges_panel.table.item(0, 2).setText("climb")
     entry = explorer.plot.ranges()[0]
     assert entry.hi == pytest.approx(EPOCH_START + 30)
     assert entry.label == "climb"
-    explorer.ranges_panel.table.item(0, 2).setText("not a time")  # rejected, old value restored
+    explorer.ranges_panel.table.item(0, 3).setText("not a time")  # rejected, old value restored
     assert explorer.plot.ranges()[0].lo == pytest.approx(EPOCH_START + 10)
     explorer.ranges_panel.removeRequested.emit(0)
     assert explorer.plot.ranges() == []
@@ -169,6 +174,16 @@ def test_detail_loading(explorer, qtbot, monkeypatch):
     explorer.load_detail()
     idle(qtbot)
     assert len(explorer.plot.data.series[0].x) > before
+
+
+def test_export_dialog_shows_scaling(explorer, qtbot, settings):
+    cfg = explorer.current_config()
+    cfg.scaling = {"speed": Scaling(3.6), "rpm": Scaling(2)}  # rpm is not exported, so not listed
+    dialog = ExportDialog(explorer.info, cfg, settings)
+    qtbot.addWidget(dialog)
+    qtbot.waitUntil(lambda: dialog.preview.toPlainText() != "", timeout=10000)
+    assert any(label.text() == "speed × 3.6" for label in dialog.findChildren(QLabel))
+    assert dialog.preview.toPlainText().splitlines()[2].split(",")[1] == "3.6"
 
 
 def test_export_dialog(explorer, qtbot, settings, tmp_path):
@@ -402,3 +417,257 @@ def test_parameter_sorting(explorer, window, telemetry, settings, qtbot):
 
 def test_natural_key():
     assert sorted(["ch10", "Ch2", "ch1", "b"], key=natural_key) == ["b", "ch1", "Ch2", "ch10"]
+
+
+# -- scaling --------------------------------------------------------------------------------
+
+
+def scaling_row(explorer, column):
+    return [name for name, _, _ in explorer.scaling_panel._rows].index(column)
+
+
+def test_scaling_panel_converts_plot_values(explorer, qtbot):
+    panel = explorer.scaling_panel
+    assert [(name, axis) for name, axis, _ in panel._rows] == [("time", "x"), ("speed", "y"), ("temp", "y")]
+    assert not panel.table.item(0, 2).flags() & Qt.ItemFlag.ItemIsEditable  # times can only be shifted
+    panel.table.item(scaling_row(explorer, "speed"), 2).setText("1/2")
+    panel.table.item(scaling_row(explorer, "speed"), 3).setText("10")
+    assert explorer.bottom_tabs.tabText(2) == "Scaling (1)"
+    assert explorer.current_config().scaling == {"speed": Scaling(0.5, 10.0)}
+    explorer.update_plot()
+    idle(qtbot)
+    assert explorer.plot.data.series[0].y[:3].tolist() == [10.0, 10.5, 11.0]
+    panel.table.item(scaling_row(explorer, "temp"), 2).setText("0")  # rejected
+    assert explorer.current_config().scaling == {"speed": Scaling(0.5, 10.0)}
+    explorer.params.set_selected_y(["temp", "label"])
+    assert [name for name, _, _ in panel._rows] == ["time", "temp", "label"]
+    assert explorer.bottom_tabs.tabText(2) == "Scaling"  # speed's scaling is kept while it is hidden
+    assert panel.table.item(2, 2).text() == "–" and "speed" in explorer.current_config().scaling
+    panel.reset_all()
+    assert explorer.current_config().scaling == {}
+
+
+def test_x_scaling_moves_ranges_and_view(explorer, qtbot):
+    explorer.plot.add_range(EPOCH_START + 10, EPOCH_START + 20, "a")
+    explorer.plot.set_x_view(EPOCH_START + 5, EPOCH_START + 30, padding=0)
+    explorer.scaling_panel.table.item(0, 3).setText("1h")
+    assert explorer.plot.data is None  # nothing is drawn in a mix of units
+    [entry] = explorer.plot.ranges()
+    assert (entry.lo, entry.hi) == (pytest.approx(EPOCH_START + 3610), pytest.approx(EPOCH_START + 3620))
+    assert explorer.current_config().ranges[0].to_dict() == {
+        "start": "2024-01-01T01:00:10", "end": "2024-01-01T01:00:20", "label": "a",
+    }
+    explorer.ranges_panel.set_mode("relative")
+    assert explorer.current_config().ranges[0].start == pytest.approx(10)
+    idle(qtbot)
+    qtbot.waitUntil(lambda: explorer.plot.data is not None, timeout=10000)
+    lo, hi = explorer.plot.view_range()
+    assert (lo, hi) == (pytest.approx(EPOCH_START + 3605), pytest.approx(EPOCH_START + 3630))
+    assert explorer.plot.data.bounds[0] == pytest.approx(EPOCH_START + 3600)
+
+
+def test_config_scaling_is_applied_and_reset_for_other_files(explorer, window, telemetry, qtbot):
+    cfg = ProcessingConfig(x="time", y=["rpm"], scaling={"rpm": Scaling(0.001), "time": Scaling(offset=-60)})
+    explorer.apply_config(cfg)
+    idle(qtbot)
+    assert explorer.current_config().scaling == cfg.scaling
+    assert explorer.plot.data.series[0].y[1] == pytest.approx(0.002)
+    assert explorer.plot.data.bounds[0] == pytest.approx(EPOCH_START - 60)
+    window.open_file(telemetry)
+    idle(qtbot)
+    assert explorer.current_config().scaling == {} and explorer.bottom_tabs.tabText(2) == "Scaling"
+
+
+# -- range colours --------------------------------------------------------------------------
+
+
+def test_range_colors(explorer, qtbot):
+    plot = explorer.plot
+    plot.add_range(EPOCH_START + 10, EPOCH_START + 20)
+    plot.add_range(EPOCH_START + 30, EPOCH_START + 40, "b", color="#00aa00")
+    assert plot.ranges()[1].regions[0].brush.color().name() == "#00aa00"
+    explorer.ranges_panel.colorChanged.emit(0, "#ff0000")  # chosen in the table
+    assert plot.ranges()[0].color == "#ff0000"
+    assert plot.ranges()[0].regions[0].brush.color().name() == "#ff0000"
+    button = explorer.ranges_panel.table.cellWidget(0, 1)
+    assert isinstance(button, ColorButton) and button.color() == "#ff0000"
+    button.set_color("", emit=True)  # back to the default colour
+    assert plot.ranges()[0].color == ""
+    assert plot.ranges()[0].regions[0].brush.color().name() == plot.theme.region
+    cfg = explorer.current_config()
+    assert [r.color for r in cfg.ranges] == ["", "#00aa00"]
+    explorer.apply_config(cfg)
+    idle(qtbot)
+    assert [r.color for r in plot.ranges()] == ["", "#00aa00"]
+
+
+def test_default_range_color_and_opacity(qtbot):
+    create_app()
+    area = PlotArea(style=PlotStyle(range_color="#123456", range_opacity=50))
+    qtbot.addWidget(area)
+    area.set_data(PlotData("x", "numeric", None, [PlotSeries("v", "v", None, np.arange(5.0), np.arange(5.0))], 5))
+    entry = area.add_range(1, 2)
+    brush = entry.regions[0].brush.color()
+    assert brush.name() == "#123456" and brush.alpha() in (127, 128)  # half opaque
+
+
+# -- plot settings --------------------------------------------------------------------------
+
+
+def test_plot_style(qtbot):
+    create_app()
+    area = PlotArea()
+    qtbot.addWidget(area)
+    series = [PlotSeries("a", "a", None, np.arange(5.0), np.arange(5.0)), PlotSeries("b", "b", None, np.arange(5.0), -np.arange(5.0))]
+    area.set_data(PlotData("x", "numeric", None, series, 5, bounds=(0.0, 4.0)))
+    area.set_style(PlotStyle(
+        theme="dark", title="Run <1>", line_width=2.5, grid=0, colors={"a": "#abcdef"}, labels={"a": "A [ft]", "x": "X [m]"},
+    ))
+    assert area.theme.dark and area.color_for("a").name() == "#abcdef" and area.color_for("b") == area.auto_color_for("b")
+    [title] = [item for item in area.glw.ci.items if isinstance(item, pg.LabelItem)]
+    assert title.text == "Run &lt;1&gt;"
+    top, bottom = area._plots
+    assert top.getAxis("left").labelText == "A [ft]" and bottom.getAxis("bottom").labelText == "X [m]"
+    [curve] = top.listDataItems()
+    assert curve.opts["pen"].widthF() == 2.5 and curve.opts["pen"].color().name() == "#abcdef"
+    assert not top.ctrl.xGridCheck.isChecked()
+    area.set_stacked(False)
+    area.set_style(PlotStyle(legend=False, overlay_label="Both"))
+    [overlay] = area._plots
+    assert overlay.legend is None and overlay.getAxis("left").labelText == "Both"
+
+
+def test_style_is_saved(explorer, settings, qtbot):
+    explorer.plot.set_style(PlotStyle(line_width=3, colors={"speed": "#010203"}, title="not kept"))
+    explorer._plot_style_applied()
+    style = load_style(settings)
+    assert style.line_width == 3 and style.colors == {"speed": "#010203"} and style.title == ""
+    page = ExplorerPage(settings)
+    qtbot.addWidget(page)
+    assert page.plot.style.colors == {"speed": "#010203"}
+    settings.setValue("plot/style", '{"line_width": "wide", "grid": true, "theme": "neon", "labels": {"a": 1}}')
+    assert load_style(settings) == PlotStyle()  # invalid values fall back to the defaults
+
+
+def test_y_limits(explorer):
+    plot = explorer.plot
+    assert [key for key, _, _ in plot.y_axes()] == ["speed", "temp"]
+    plot.set_y_limits({"speed": (-100, 1000)})
+    vb = plot._plots[0].getViewBox()
+    assert vb.viewRange()[1] == [-100, 1000]
+    plot.set_x_view(EPOCH_START + 10, EPOCH_START + 20)  # auto Y leaves the fixed range alone
+    assert vb.viewRange()[1] == [-100, 1000]
+    assert plot._plots[1].getViewBox().autoRangeEnabled()[1]
+    plot.set_stacked(False)
+    plot.set_stacked(True)  # kept while the parameter is shown
+    assert plot._plots[0].getViewBox().viewRange()[1] == [-100, 1000]
+    plot.reset_view()
+    assert plot.y_limits() == {} and plot._plots[0].getViewBox().autoRangeEnabled()[1]
+
+
+def test_plot_settings_dialog(explorer, qtbot, settings, monkeypatch):
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: warnings.append(a[2])))
+    explorer.act_plot_settings.trigger()
+    [dialog] = explorer.findChildren(PlotSettingsDialog)
+    assert [column for column, _, _ in dialog._series] == ["time", "speed", "temp"]
+    dialog.title_edit.setText("Test run")
+    dialog.line_spin.setValue(2)
+    dialog.grid_spin.setValue(0)
+    dialog.range_color.set_color("#00ff00")
+    _, button, label = dialog._series[1]
+    button.set_color("#ff00ff")
+    label.setText("Speed [m/s]")
+    dialog._series[0][2].setText("Time")
+    dialog.x_min.setText("2024-01-01 00:00:10")
+    dialog.x_max.setText("2024-01-01 00:00:20")
+    key, automatic, lo, hi = dialog._y_rows[0]
+    lo.setText("0")
+    lo.textEdited.emit("0")
+    hi.setText("500")
+    assert key == "speed" and not automatic.isChecked()
+    assert dialog.apply()
+    plot = explorer.plot
+    assert plot.style.title == "Test run" and plot.style.colors["speed"] == "#ff00ff"
+    assert plot.style.labels == {"speed": "Speed [m/s]", "time": "Time"} and plot.style.range_color == "#00ff00"
+    assert plot.view_range() == (pytest.approx(EPOCH_START + 10), pytest.approx(EPOCH_START + 20))
+    assert plot.y_limits() == {"speed": (0.0, 500.0)}
+    assert load_style(settings).colors == {"speed": "#ff00ff"}  # saved by the explorer
+    hi.setText("-1")
+    assert not dialog.apply() and "maximum must be larger" in warnings[-1]
+    dialog.restore_defaults()
+    assert dialog.apply() and plot.style.colors == {} and plot.style.title == "" and plot.y_limits() == {}
+
+
+def test_context_menu_offers_plot_actions(explorer, qtbot):
+    actions = explorer.plot.glw.scene().contextMenu
+    assert actions == [explorer.act_plot_settings, explorer.act_export_image, explorer.act_copy_image]
+    assert explorer.act_export_image.isEnabled() and explorer.act_copy_image.isEnabled()
+    explorer.params.set_selected_y([])
+    explorer.update_plot()
+    idle(qtbot)
+    assert not explorer.act_export_image.isEnabled() and not explorer.act_copy_image.isEnabled()
+
+
+# -- image export ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("suffix", [".png", ".jpg", ".svg", ".pdf"])
+def test_save_image(explorer, tmp_path, suffix):
+    plot = explorer.plot
+    view = plot.view_range()
+    size = plot.image_size()
+    path = plot.save_image(tmp_path / f"plot{suffix}", QSize(800, 400), resolution=2.0)
+    assert path.stat().st_size > 1000
+    if suffix in (".png", ".jpg"):
+        image = QImage(str(path))
+        assert (image.width(), image.height()) == (1600, 800)
+    elif suffix == ".svg":
+        assert b"<svg" in path.read_bytes()[:500]
+    else:
+        assert path.read_bytes().startswith(b"%PDF")
+    assert plot.view_range() == view and plot.image_size() == size  # the window is untouched
+
+
+def test_render_image_options(explorer):
+    plot = explorer.plot
+    size = plot.image_size()
+    image = plot.render_image(resolution=1.0, transparent=True)
+    assert (image.width(), image.height()) == (size.width(), size.height())
+    assert image.pixelColor(0, 0).alpha() == 0
+    plot.copy_image()
+    assert not QGuiApplication.clipboard().image().isNull()
+    with pytest.raises(ValueError, match="Unsupported image format"):
+        plot.save_image("plot.gif")
+
+
+def test_image_export_dialog(explorer, qtbot, settings, tmp_path):
+    dialog = ImageExportDialog(explorer.plot, settings, explorer.info.path)
+    qtbot.addWidget(dialog)
+    assert dialog.path().name == "telemetry_plot.png" and dialog.resolution() == 2.0
+    dialog.format_combo.setCurrentIndex(dialog.format_combo.findData(".svg"))
+    assert dialog.path().suffix == ".svg" and not dialog.resolution_combo.isEnabled()
+    dialog.path_edit.setText(str(tmp_path / "out" / "figure.jpg"))
+    assert dialog.suffix() == ".jpg" and not dialog.transparent_check.isEnabled()
+    dialog.width_spin.setValue(500)
+    dialog.height_spin.setValue(300)
+    dialog.resolution_combo.setCurrentIndex(dialog.resolution_combo.findData(1.0))
+    assert dialog.info_label.text() == "The image will be 500 × 300 pixels"
+    saved = []
+    dialog.saved.connect(saved.append)
+    assert dialog.save() == tmp_path / "out" / "figure.jpg"
+    assert saved and QImage(saved[0]).width() == 500
+    assert settings.value("image/format") == ".jpg" and settings.value("image/last_dir") == str(tmp_path / "out")
+    again = ImageExportDialog(explorer.plot, settings, explorer.info.path)
+    qtbot.addWidget(again)
+    assert again.path() == tmp_path / "out" / "telemetry_plot.jpg" and again.resolution() == 1.0
+
+
+def test_export_image_action(explorer, window, tmp_path, monkeypatch, qtbot):
+    explorer.act_copy_image.trigger()
+    assert window.statusBar().currentMessage() == "Copied the plot to the clipboard"
+    explorer.act_export_image.trigger()
+    [dialog] = [w for w in explorer.findChildren(ImageExportDialog)]
+    dialog.path_edit.setText(str(tmp_path / "shot.png"))
+    dialog.save()
+    assert (tmp_path / "shot.png").exists() and "shot.png" in window.statusBar().currentMessage()

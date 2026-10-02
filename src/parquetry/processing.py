@@ -19,7 +19,7 @@ import os
 import re
 import sys
 import threading
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import reduce
 from pathlib import Path
@@ -29,8 +29,8 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import polars as pl
 
-from .config import AGG_METHOD_LABELS, LINE_TERMINATORS, ConfigError, ProcessingConfig, TimeRange
-from .dataset import DATA_SUFFIXES, ROW_INDEX, DatasetInfo, inspect_file
+from .config import AGG_METHOD_LABELS, LINE_TERMINATORS, ConfigError, ProcessingConfig, Scaling, TimeRange
+from .dataset import DATA_SUFFIXES, ROW_INDEX, ColumnInfo, DatasetInfo, inspect_file
 from .durations import is_duration, parse_duration_us, parse_offset_seconds, to_polars_duration
 
 UTC = dt.timezone.utc
@@ -218,6 +218,7 @@ def validate_for(cfg: ProcessingConfig, info: DatasetInfo, *, require_y: bool = 
         if require_y:
             cfg.validate()
         else:
+            cfg.validate_scaling()
             cfg.aggregation.validate()
             cfg.csv.validate()
     except ConfigError as exc:
@@ -245,8 +246,23 @@ def validate_for(cfg: ProcessingConfig, info: DatasetInfo, *, require_y: bool = 
             )
         if cfg.ranges:
             raise ProcessingError(f"Ranges need a numeric or time x axis, but {cfg.x!r} is text")
+    for name in dict.fromkeys([cfg.x, *cfg.y]):
+        _check_scaling(name, info.column(name), cfg.scaling_for(name))
     if cfg.aggregation.method == "interval":
         _interval_width(cfg, info)  # raises on a mismatch between x type and interval
+
+
+def _check_scaling(name: str, col: ColumnInfo, scaling: Scaling | None) -> None:
+    if scaling is None:
+        return
+    if col.kind not in {"numeric", "duration", "datetime", "date"}:
+        raise ProcessingError(f"Column {name!r} ({col.dtype_name}) cannot be scaled; only numbers and times can")
+    if col.is_temporal and scaling.scale != 1:
+        raise ProcessingError(f"Times in {name!r} can only be shifted with an offset, not scaled")
+    if isinstance(scaling.offset, str) and col.kind not in {"datetime", "date", "duration"}:
+        raise ProcessingError(
+            f"The offset {scaling.offset!r} of {name!r} is a duration, but the column holds plain numbers"
+        )
 
 
 def _interval_width(cfg: ProcessingConfig, info: DatasetInfo) -> str | float:
@@ -277,11 +293,24 @@ def _interval_width(cfg: ProcessingConfig, info: DatasetInfo) -> str | float:
     return width
 
 
-def _scan(info: DatasetInfo, x: str, columns: Sequence[str]) -> pl.LazyFrame:
-    """Lazy frame with *columns* normalised for processing and null x rows removed."""
+def _scan(
+    info: DatasetInfo,
+    x: str,
+    columns: Sequence[str],
+    scaling: Mapping[str, Scaling] | None = None,
+    resolved: Resolved | None = None,
+) -> pl.LazyFrame:
+    """Lazy frame with *columns* normalised for processing, scaled, and null x rows removed.
+
+    *resolved* ranges (in x units after scaling) are only used to pre-filter
+    the stored values; callers still filter the scaled values exactly.
+    """
     lf = info.scan()
     if ROW_INDEX in columns:
         lf = lf.with_row_index(ROW_INDEX)
+    prefilter = _stored_x_filter(info, x, resolved or [], (scaling or {}).get(x))
+    if prefilter is not None:
+        lf = lf.filter(prefilter)
     exprs = []
     for name in dict.fromkeys(columns):
         col = info.column(name)
@@ -294,6 +323,9 @@ def _scan(info: DatasetInfo, x: str, columns: Sequence[str]) -> pl.LazyFrame:
             expr = expr.cast(pl.Float64)
         elif col.kind == "text" and col.dtype != pl.String:
             expr = expr.cast(pl.String)  # categoricals
+        factor = scaling.get(name) if scaling else None
+        if factor is not None and not factor.is_identity:
+            expr = _scaled(expr, col, factor)
         exprs.append(expr.alias(name))
     lf = lf.select(exprs)
     keep = pl.col(x).is_not_null()
@@ -302,12 +334,73 @@ def _scan(info: DatasetInfo, x: str, columns: Sequence[str]) -> pl.LazyFrame:
     return lf.filter(keep)
 
 
+def _scaled(expr: pl.Expr, col: ColumnInfo, scaling: Scaling) -> pl.Expr:
+    """``value * scale + offset``; times are only shifted by the offset."""
+    if col.is_temporal:
+        return expr + pl.lit(dt.timedelta(microseconds=round(scaling.offset_value * 1e6)))
+    expr = expr.cast(pl.Float64)
+    if scaling.scale != 1:
+        expr = expr * scaling.scale
+    if scaling.offset_value:
+        expr = expr + scaling.offset_value
+    return expr
+
+
+def _stored_x_filter(info: DatasetInfo, x: str, resolved: Resolved, scaling: Scaling | None) -> pl.Expr | None:
+    """A filter on the stored x values that keeps (at least) the rows in *resolved*, given in scaled units.
+
+    Filters on scaled values cannot use Parquet statistics to skip row groups;
+    this one can. It is only built for columns stored as they are compared.
+    """
+    if scaling is None or scaling.is_identity or not resolved or x == ROW_INDEX:
+        return None
+    col = info.column(x)
+    kind = info.x_kind(x)
+    if not (isinstance(col.dtype, pl.Datetime) or (col.kind == "numeric" and not isinstance(col.dtype, pl.Decimal))):
+        return None
+    shift = dt.timedelta(microseconds=round(scaling.offset_value * 1e6))
+    bounds = []
+    for lo, hi in resolved:
+        stored = []
+        for value in (lo, hi):
+            if value is None:
+                stored.append(None)
+            elif kind == "datetime":
+                stored.append(value - shift)  # the exact inverse of the shift
+            else:
+                stored.append(scaling.invert(float(value)))
+        if kind != "datetime" and scaling.scale < 0:
+            stored.reverse()
+        if kind != "datetime":  # widened, so that rounding cannot drop rows at the bounds
+            stored = [None if v is None else v + sign * 1e-9 * max(1.0, abs(v)) for v, sign in zip(stored, (-1, 1))]
+        bounds.append(tuple(stored))
+    return _range_predicate(x, bounds, kind, col.time_zone)
+
+
+def scale_x(value: Any, kind: str, scaling: Scaling | None) -> Any:
+    """Apply *scaling* to one x value (a ``datetime`` or a number)."""
+    if scaling is None or value is None:
+        return value
+    if kind == "datetime":
+        return value + dt.timedelta(microseconds=round(scaling.offset_value * 1e6))
+    return scaling.apply(float(value))
+
+
 _bounds_cache: dict[tuple, Bounds | None] = {}
 _bounds_lock = threading.Lock()
 
 
-def data_bounds(info: DatasetInfo, x: str) -> Bounds | None:
-    """First and last x value of the file (cached per file version)."""
+def data_bounds(info: DatasetInfo, x: str, scaling: Scaling | None = None) -> Bounds | None:
+    """Lowest and highest x value of the file, after *scaling* (cached per file version)."""
+    bounds = _raw_bounds(info, x)
+    if bounds is None or scaling is None or scaling.is_identity or info.x_kind(x) == "category":
+        return bounds
+    kind = info.x_kind(x)
+    lo, hi = scale_x(bounds.lo, kind, scaling), scale_x(bounds.hi, kind, scaling)
+    return Bounds(min(lo, hi), max(lo, hi))
+
+
+def _raw_bounds(info: DatasetInfo, x: str) -> Bounds | None:
     key = (*info.cache_key(), x)
     with _bounds_lock:
         if key in _bounds_cache:
@@ -332,14 +425,14 @@ def data_bounds(info: DatasetInfo, x: str) -> Bounds | None:
 _distinct_cache: dict[tuple, int] = {}
 
 
-def _distinct_x(info: DatasetInfo, x: str, resolved: Resolved) -> int:
+def _distinct_x(info: DatasetInfo, x: str, resolved: Resolved, scaling: Scaling | None = None) -> int:
     """Number of distinct x values within *resolved* (cached per file version)."""
-    key = (*info.cache_key(), x, tuple(resolved))
+    key = (*info.cache_key(), x, tuple(resolved), scaling)
     with _bounds_lock:
         if key in _distinct_cache:
             return _distinct_cache[key]
     kind, tz = _x_meta(info, x)
-    lf = _scan(info, x, [x])
+    lf = _scan(info, x, [x], {x: scaling} if scaling else None, resolved)
     predicate = _range_predicate(x, resolved, kind, tz)
     if predicate is not None:
         lf = lf.filter(predicate)
@@ -371,7 +464,7 @@ def resolve_ranges(
                 bounds.append(None)
             elif cfg.range_mode == "relative":
                 if base is None:
-                    data = data_bounds(info, cfg.x)
+                    data = data_bounds(info, cfg.x, cfg.scaling_for(cfg.x))
                     if data is None:
                         raise ProcessingError(f"{info.path.name} has no rows with a valid x value")
                     base = data.lo
@@ -403,8 +496,8 @@ def _range_predicate(x: str, resolved: Resolved, kind: str, tz: str | None) -> p
     return reduce(operator.or_, terms) if terms else None
 
 
-def _span(info: DatasetInfo, x: str, resolved: Resolved) -> Bounds | None:
-    data = data_bounds(info, x)
+def _span(info: DatasetInfo, x: str, resolved: Resolved, scaling: Scaling | None = None) -> Bounds | None:
+    data = data_bounds(info, x, scaling)
     if data is None or not resolved:
         return data
     lo = min(data.lo if a is None else a for a, _ in resolved)
@@ -413,9 +506,9 @@ def _span(info: DatasetInfo, x: str, resolved: Resolved) -> Bounds | None:
     return Bounds(lo, hi) if lo <= hi else None
 
 
-def covered_fraction(info: DatasetInfo, x: str, resolved: Resolved) -> float:
-    """Approximate share of the x span covered by *resolved* ranges."""
-    data = data_bounds(info, x)
+def covered_fraction(info: DatasetInfo, x: str, resolved: Resolved, scaling: Scaling | None = None) -> float:
+    """Approximate share of the x span covered by *resolved* ranges (in x units after *scaling*)."""
+    data = data_bounds(info, x, scaling)
     if data is None:
         return 0.0
     if not resolved:
@@ -477,7 +570,7 @@ def _aggregate(lf: pl.LazyFrame, info: DatasetInfo, cfg: ProcessingConfig, span:
         return lf.gather_every(agg.n)
     x = cfg.x
     kind, tz = _x_meta(info, x)
-    integer = info.column(x).dtype.is_integer()
+    integer = info.column(x).dtype.is_integer() and cfg.scaling_for(x) is None  # scaled values are floats
     if agg.method == "per_value":
         bucket = pl.col(x)
     elif agg.method == "interval":
@@ -510,7 +603,7 @@ def processed_frame(
     x = cfg.x
     ys = [c for c in dict.fromkeys(cfg.y) if c != x]
     kind, tz = _x_meta(info, x)
-    lf = _scan(info, x, [x, *ys])
+    lf = _scan(info, x, [x, *ys], cfg.scaling, resolved)
     predicate = _range_predicate(x, resolved, kind, tz)
     if predicate is not None:
         lf = lf.filter(predicate)
@@ -518,13 +611,14 @@ def processed_frame(
         lf = lf.head(row_limit)
     if (cfg.sort if sort is None else sort) and kind != "category":
         lf = lf.sort(x)
-    return _aggregate(lf, info, cfg, _span(info, x, resolved))
+    return _aggregate(lf, info, cfg, _span(info, x, resolved, cfg.scaling_for(x)))
 
 
 def estimate_rows(info: DatasetInfo, cfg: ProcessingConfig, resolved: Resolved | None = None) -> int:
     """Estimated number of rows the configuration produces (for UI hints)."""
     resolved = resolved or []
-    fraction = covered_fraction(info, cfg.x, resolved) if resolved else 1.0
+    scaling = cfg.scaling_for(cfg.x)
+    fraction = covered_fraction(info, cfg.x, resolved, scaling) if resolved else 1.0
     rows = info.num_rows * fraction
     agg = cfg.aggregation
     if agg.method == "none":
@@ -534,8 +628,8 @@ def estimate_rows(info: DatasetInfo, cfg: ProcessingConfig, resolved: Resolved |
     if agg.method == "target_points":
         return int(min(rows, agg.points * max(1, len(resolved))))
     if agg.method == "per_value":
-        return _distinct_x(info, cfg.x, resolved)
-    data = data_bounds(info, cfg.x)
+        return _distinct_x(info, cfg.x, resolved, scaling)
+    data = data_bounds(info, cfg.x, scaling)
     if data is None:
         return 0
     kind = info.x_kind(cfg.x)
@@ -583,7 +677,7 @@ def csv_frame(lf: pl.LazyFrame, info: DatasetInfo, cfg: ProcessingConfig) -> pl.
     fmt = cfg.csv.time_format
     expr = None
     if fmt == "elapsed_s" and kind != "category":
-        data = data_bounds(info, x)
+        data = data_bounds(info, x, cfg.scaling_for(x))
         base = data.lo if data else None
         if base is not None:
             if kind == "datetime":
@@ -951,7 +1045,7 @@ def load_plot_data(
         view = None  # positions depend on the loaded categories, so there is no detail to load
         max_points = min(max_points, CATEGORY_MAX_POINTS)
     else:
-        data = data_bounds(info, x)
+        data = data_bounds(info, x, cfg.scaling_for(x))
     bounds = (x_to_plot(data.lo, kind), x_to_plot(data.hi, kind)) if data else None
     result = PlotData(x, kind, tz, [], 0, bounds=bounds, view=view)
     if not columns or (data is None and not category):

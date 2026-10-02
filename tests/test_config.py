@@ -1,6 +1,14 @@
 import pytest
 
-from parquetry.config import AggregationConfig, ConfigError, CsvOptions, ProcessingConfig, TimeRange
+from parquetry.config import (
+    AggregationConfig,
+    ConfigError,
+    CsvOptions,
+    ProcessingConfig,
+    Scaling,
+    TimeRange,
+    parse_number,
+)
 from parquetry.durations import (
     format_seconds,
     parse_duration_us,
@@ -68,6 +76,11 @@ def test_copy_is_deep():
         ({"x": "t", "y": ["a"], "csv": {"decimal_comma": True}}, "Decimal comma"),
         ({"x": "t", "y": []}, "No y parameters"),
         ({"x": "t", "y": ["a"], "version": 99}, "Unsupported configuration version"),
+        ({"x": "t", "y": ["a"], "scaling": {"a": {"scale": 0}}}, "non-zero scale"),
+        ({"x": "t", "y": ["a"], "scaling": {"a": {"offset": "soon"}}}, "neither a number nor a duration"),
+        ({"x": "t", "y": ["a"], "scaling": {"a": {"factor": 2}}}, "Unknown scaling"),
+        ({"x": "t", "y": ["a"], "scaling": {"a": 2}}, "A scaling needs"),
+        ({"x": "t", "y": ["a"], "ranges": [{"start": 1, "end": 2, "color": "#12"}]}, "Invalid range color"),
     ],
 )
 def test_validation_errors(data, message):
@@ -110,3 +123,50 @@ def test_durations():
     assert format_seconds(2.5) == "2.5 s"
     with pytest.raises(ValueError):
         parse_duration_us("5 minutes")
+
+
+def test_scaling_round_trip():
+    cfg = ProcessingConfig(
+        x="time", y=["a", "b"],
+        scaling={"a": Scaling(3.28084), "b": Scaling(9 / 5, 32), "time": Scaling(offset="-2h"), "c": Scaling()},
+    )
+    data = cfg.to_dict()
+    # Only columns that are converted are written, and only what differs from the default.
+    assert data["scaling"] == {"a": {"scale": 3.28084}, "b": {"scale": 1.8, "offset": 32}, "time": {"offset": "-2h"}}
+    loaded = ProcessingConfig.from_json(cfg.to_json())
+    assert loaded.scaling == {"a": Scaling(3.28084), "b": Scaling(1.8, 32.0), "time": Scaling(offset="-2h")}
+    assert loaded.scaling_for("time").offset_value == -7200
+    assert loaded.scaling_for("c") is None and loaded.scaling_for("missing") is None
+    assert "scaling" not in ProcessingConfig(x="t", y=["a"]).to_dict()  # older versions can read it
+    # Factors may be written as arithmetic, which is stored as the number.
+    assert ProcessingConfig.from_dict({"x": "t", "y": ["a"], "scaling": {"a": {"scale": "1/4"}}}).scaling["a"].scale == 0.25
+
+
+def test_scaling_math():
+    scaling = Scaling(1.8, 32)
+    assert scaling.apply(100) == 212 and scaling.invert(212) == 100
+    assert Scaling().is_identity and Scaling(1, "0s").is_identity and not Scaling(1, "1s").is_identity
+
+
+def test_parse_number():
+    assert parse_number("1/3.6") == pytest.approx(0.277777777)
+    assert parse_number(" -(9/5) * 2 ") == -3.6
+    assert parse_number(3) == 3.0
+    for bad in ("2h", "abs(-1)", "1/0", "1e400", "", "__import__('os')", "2**3"):
+        with pytest.raises(ValueError):
+            parse_number(bad)
+
+
+def test_range_color_round_trip():
+    cfg = ProcessingConfig(x="t", y=["a"], ranges=[TimeRange(0, 10, "a", "#ff8800"), TimeRange(20, 30)])
+    data = cfg.to_dict()
+    assert data["ranges"] == [{"start": 0, "end": 10, "label": "a", "color": "#ff8800"}, {"start": 20, "end": 30}]
+    assert ProcessingConfig.from_dict(data).ranges[0].color == "#ff8800"
+    assert TimeRange.from_value({"start": 1, "end": 2, "color": "teal"}).color == "teal"
+
+
+def test_scaling_describe():
+    assert Scaling(1.8, 32).describe() == "× 1.8 + 32"
+    assert Scaling(0.5, -40).describe() == "× 0.5 − 40"
+    assert Scaling(offset="-30m").describe() == "− 30m"
+    assert Scaling().describe() == "as is"
