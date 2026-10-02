@@ -6,7 +6,7 @@ import polars as pl
 import pytest
 
 from parquetry.cli import build_parser, command_line, config_from_args, config_to_args, main
-from parquetry.config import AggregationConfig, CsvOptions, OutputOptions, ProcessingConfig, TimeRange
+from parquetry.config import AggregationConfig, CsvOptions, OutputOptions, ProcessingConfig, Scaling, TimeRange
 from parquetry.dataset import inspect_file
 
 
@@ -142,6 +142,9 @@ def test_sample(tmp_path, capsys):
         ProcessingConfig(x="d", y=["a"], aggregation=AggregationConfig(method="target_points", points=99, functions=["std"]),
                          csv=CsvOptions(separator=";", decimal_comma=True)),
         ProcessingConfig(x="region", y=["a", "b"], aggregation=AggregationConfig(method="per_value", functions=["mean", "last"])),
+        ProcessingConfig(x="time", y=["a", "b"], scaling={
+            "a": Scaling(1 / 3.6), "b": Scaling(9 / 5, -40.5), "time": Scaling(offset="-2h30m"), "c=d": Scaling(offset=7),
+        }),
     ],
 )
 def test_config_to_args_round_trip(cfg):
@@ -173,3 +176,18 @@ def test_generated_command_writes_next_to_input(telemetry, tmp_path, monkeypatch
     assert main(shlex.split(cmd)[1:]) == 0
     assert sorted(p.name for p in telemetry.parent.glob("*.csv")) == ["telemetry_part_a.csv", "telemetry_part_b.csv"]
     assert not list(elsewhere.iterdir())
+
+
+def test_export_with_scaling(telemetry, capsys):
+    args = ["export", str(telemetry), "--y", "speed", "rpm", "--scale", "speed=1/2", "--offset", "speed=10",
+            "--offset", "time=1h", "--n", "300", "-o", "-", "-q"]
+    assert main(args) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "time,speed,rpm", "2024-01-01T01:00:00.000000,10.0,0", "2024-01-01T01:00:30.000000,160.0,600",
+    ]
+    for bad in (["--scale", "speed=0"], ["--scale", "=2"], ["--offset", "speed=soon"]):
+        with pytest.raises(SystemExit):
+            main(["export", str(telemetry), *bad])
+    assert "must not be zero" in capsys.readouterr().err
+    assert main(["export", str(telemetry), "--y", "label", "--scale", "label=2", "-o", "-"]) == 1
+    assert "cannot be scaled" in capsys.readouterr().err

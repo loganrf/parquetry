@@ -1,4 +1,4 @@
-"""The explorer page: parameter selection, aggregation, plot, ranges and data table."""
+"""The explorer page: parameter selection, aggregation, plot, ranges, scaling and data table."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import ProcessingConfig, TimeRange
+from ..config import ProcessingConfig, Scaling, TimeRange
 from ..dataset import DatasetInfo, format_bytes
 from ..processing import (
     PlotData,
@@ -35,8 +35,11 @@ from ..processing import (
 )
 from . import workers
 from .data_table import DataPanel
-from .panels import AggregationPanel, ParameterPanel, RangePanel
+from .image_export import ImageExportDialog
+from .panels import AggregationPanel, ParameterPanel, RangePanel, ScalingPanel
 from .plot_area import PlotArea, format_plot_x
+from .plot_settings import PlotSettingsDialog
+from .theme import load_style, save_style
 
 
 def _plot_job(info: DatasetInfo, cfg: ProcessingConfig, pending: ProcessingConfig | None, view=None):
@@ -53,6 +56,7 @@ def _plot_job(info: DatasetInfo, cfg: ProcessingConfig, pending: ProcessingConfi
                     lo_all if lo is None else x_to_plot(lo, data.x_kind),
                     hi_all if hi is None else x_to_plot(hi, data.x_kind),
                     rng.label,
+                    rng.color,
                 )
             )
     return data, spans
@@ -78,6 +82,11 @@ class ExplorerPage(QWidget):
         self._loaded_x: str | None = None
         self._table_generation = 0
         self._table_stale = True
+        #: Scaling shown in the scaling panel when it last changed, and the x scaling of the plot's units.
+        self._scaling: dict[str, Scaling] = {}
+        self._x_scaling: Scaling | None = None
+        #: x window to show once the next plot data arrives (after the x units changed).
+        self._next_view: tuple[float, float] | None = None
 
         # -- widgets -----------------------------------------------------------
         self.file_label = QLabel()
@@ -87,7 +96,7 @@ class ExplorerPage(QWidget):
         self.params.set_sort(settings.value("parameters/sort", "file"), settings.value("parameters/reverse", False, type=bool))
         self.params.sortChanged.connect(self._sort_changed)
         self.params.xChanged.connect(self._x_changed)
-        self.params.yChanged.connect(self.schedule_update)
+        self.params.yChanged.connect(self._y_changed)
         self.aggregation = AggregationPanel()
         self.aggregation.changed.connect(self.schedule_update)
         self.auto_update = QCheckBox("Auto update")
@@ -113,7 +122,7 @@ class ExplorerPage(QWidget):
         side.addWidget(self.export_button)
         sidebar.setMinimumWidth(280)
 
-        self.plot = PlotArea()
+        self.plot = PlotArea(style=load_style(settings))
         self.plot.set_stacked(settings.value("plot/stacked", True, type=bool))
         self.plot.set_show_points(settings.value("plot/points", False, type=bool))
         self.plot.rangesChanged.connect(self._ranges_changed)
@@ -125,6 +134,10 @@ class ExplorerPage(QWidget):
         self.ranges_panel.zoomRequested.connect(self.plot.zoom_to_range)
         self.ranges_panel.zoomAllRequested.connect(self.plot.zoom_to_ranges)
         self.ranges_panel.editRequested.connect(self._range_edited)
+        self.ranges_panel.colorChanged.connect(self.plot.set_range_color)
+        self.scaling_panel = ScalingPanel()
+        self.scaling_panel.changed.connect(self._scaling_changed)
+        self.scaling_panel.invalid.connect(self.status.emit)
 
         self.detail_banner = QLabel()
         self.detail_banner.setWordWrap(True)
@@ -148,10 +161,12 @@ class ExplorerPage(QWidget):
             self.act_auto_y,
             self.act_reset,
             self.act_detail,
+            self.act_plot_settings,
             None,
             self.act_load_config,
             self.act_save_config,
             self.act_export,
+            self.act_export_image,
         ):
             if action is None:
                 self.toolbar.addSeparator()
@@ -171,6 +186,8 @@ class ExplorerPage(QWidget):
         self.bottom_tabs.addTab(self.ranges_panel, "Ranges")
         self.bottom_tabs.addTab(self.data_panel, "Data")
         self.bottom_tabs.setTabToolTip(1, "The rows behind the visible part of the plot, including text columns")
+        self.bottom_tabs.addTab(self.scaling_panel, "Scaling")
+        self.bottom_tabs.setTabToolTip(2, "Scale and offset of values, e.g. to convert units or correct a sensor")
         self.bottom_tabs.setCurrentIndex(settings.value("explorer/bottom_tab", 0, type=int))
         self.bottom_tabs.currentChanged.connect(self._bottom_tab_changed)
         right.addWidget(plot_box)
@@ -242,6 +259,15 @@ class ExplorerPage(QWidget):
         self.act_save_config = action("Save config…", "Ctrl+S", "Save the current processing configuration")
         self.act_export = action("Export CSV…", "Ctrl+E", "Export the selected data to CSV")
         self.export_button.clicked.connect(self.act_export.trigger)
+        self.act_plot_settings = action(
+            "Plot settings…", "Ctrl+Shift+P", "Colours, line widths, labels, title and axis ranges of the plots"
+        )
+        self.act_plot_settings.triggered.connect(self.open_plot_settings)
+        self.act_export_image = action("Export image…", "Ctrl+Shift+E", "Save the plots as a PNG, JPEG, SVG or PDF image")
+        self.act_export_image.triggered.connect(self.export_image)
+        self.act_copy_image = action("Copy plot image", "Ctrl+Shift+C", "Copy the plots to the clipboard as an image")
+        self.act_copy_image.triggered.connect(self.copy_image)
+        self.plot.set_menu_actions([self.act_plot_settings, self.act_export_image, self.act_copy_image])
 
     def _set_stacked(self, on: bool) -> None:
         self.settings.setValue("plot/stacked", on)
@@ -265,6 +291,8 @@ class ExplorerPage(QWidget):
             act.setEnabled(ranges)
         data = self._overview
         self.act_detail.setEnabled(bool(data and data.reduced and data.x_kind != "category"))
+        for act in (self.act_export_image, self.act_copy_image):
+            act.setEnabled(self.plot.has_plots())
 
     # ----------------------------------------------------------------- dataset
     def set_dataset(self, info: DatasetInfo, cfg: ProcessingConfig | None = None) -> list[str]:
@@ -273,6 +301,9 @@ class ExplorerPage(QWidget):
         self._overview = None
         self._loaded_x = None
         self.plot.clear()
+        self.plot.clear_y_limits()
+        self.scaling_panel.set_scaling({})  # values of another file are used as they are
+        self._scaling, self._x_scaling, self._next_view = {}, None, None
         self._table_generation += 1  # drop rows still loading for the previous file
         self.data_panel.set_message("Loading…")
         self._table_stale = True
@@ -286,6 +317,7 @@ class ExplorerPage(QWidget):
         warnings: list[str] = []
         self.params.set_dataset(info, base.x, base.y)
         self._configure_x()
+        self._refresh_scaling_rows()
         if cfg is not None:
             warnings = self.apply_config(cfg, reload=False)
         self.update_plot()
@@ -305,6 +337,11 @@ class ExplorerPage(QWidget):
         self.params.set_x(cfg.x)
         self._configure_x()
         self.params.set_selected_y(self.cfg.y)
+        self.scaling_panel.set_scaling(self.cfg.scaling)
+        self._scaling = self.scaling_panel.scaling()
+        self._refresh_scaling_rows()
+        self.plot.clear_y_limits()
+        self._apply_x_scaling(self.cfg.scaling_for(cfg.x))
         self.aggregation.set_config(cfg.aggregation)
         self.ranges_panel.set_mode(cfg.range_mode)
         self.plot.clear_ranges()
@@ -329,6 +366,10 @@ class ExplorerPage(QWidget):
             return
         old_kind = self.info.x_kind(self._loaded_x) if self._loaded_x else None
         self._configure_x()
+        self._refresh_scaling_rows()
+        # Ranges kept below are absolute times; the new column's scaling defines the units from now on.
+        self._x_scaling = self.scaling_panel.scaling().get(x)
+        self._next_view = None
         if old_kind != self.info.x_kind(x) or old_kind != "datetime":
             if self.plot.ranges():
                 self.status.emit("Ranges cleared because the x axis changed")
@@ -339,12 +380,66 @@ class ExplorerPage(QWidget):
             self._update_detail_banner()
         self.schedule_update()
 
+    def _y_changed(self) -> None:
+        self._refresh_scaling_rows()
+        self.schedule_update()
+
+    # ---------------------------------------------------------------- scaling
+    def _refresh_scaling_rows(self) -> None:
+        if self.info is None:
+            return
+        self.scaling_panel.set_columns(self.info, self.params.x(), self.params.selected_y())
+        self._update_scaling_tab()
+
+    def _update_scaling_tab(self) -> None:
+        count = self.scaling_panel.scaled_count()
+        index = self.bottom_tabs.indexOf(self.scaling_panel)
+        self.bottom_tabs.setTabText(index, f"Scaling ({count})" if count else "Scaling")
+
+    def _scaling_changed(self) -> None:
+        scaling = self.scaling_panel.scaling()
+        changed = {c for c in {*scaling, *self._scaling} if scaling.get(c) != self._scaling.get(c)}
+        self._scaling = scaling
+        self._update_scaling_tab()
+        x = self.params.x()
+        if changed - {x}:
+            # Fixed y ranges of plots whose values changed no longer fit them.
+            self.plot.clear_y_limits([*(changed - {x}), None])
+        self._apply_x_scaling(scaling.get(x))
+        self.schedule_update()
+
+    def _apply_x_scaling(self, new: Scaling | None) -> None:
+        """Move the ranges and the view into the x units of a new x scaling.
+
+        The plot is cleared until data in the new units arrives, so that
+        nothing is drawn or selected in a mix of old and new units.
+        """
+        old = self._x_scaling
+        if new == old:
+            return
+        self._x_scaling = new
+
+        def convert(value: float) -> float:
+            raw = old.invert(value) if old else value
+            return new.apply(raw) if new else raw
+
+        view = self.plot.view_range() or self._next_view
+        ranges = self.plot.ranges()
+        if ranges:
+            self.plot.set_ranges([(convert(e.lo), convert(e.hi), e.label, e.color) for e in ranges])
+        self._next_view = tuple(sorted(convert(v) for v in view)) if view else None
+        self._overview = self.plot_data = None
+        waiting = "Loading…" if self.auto_update.isChecked() else "Press Update plot to show the new x values"
+        self.plot.set_data(None, keep_view=False, message=waiting)
+        self._update_detail_banner()
+
     # ------------------------------------------------------------------- plot
     def current_config(self) -> ProcessingConfig:
         """The configuration shown in the UI, including ranges."""
         cfg = self.cfg.copy()
         cfg.x = self.params.x()
         cfg.y = self.params.selected_y()
+        cfg.scaling = self.scaling_panel.scaling()
         cfg.aggregation = self.aggregation.config()
         cfg.range_mode = self.ranges_panel.mode()
         cfg.ranges = self.config_ranges(cfg.range_mode)
@@ -364,17 +459,18 @@ class ExplorerPage(QWidget):
         out = []
         for entry in self.plot.ranges():
             if mode == "relative" and start is not None:
-                out.append(TimeRange(round(entry.lo - start, 6), round(entry.hi - start, 6), entry.label))
+                out.append(TimeRange(round(entry.lo - start, 6), round(entry.hi - start, 6), entry.label, entry.color))
             elif kind == "datetime":
                 out.append(
                     TimeRange(
                         format_x(plot_to_x(entry.lo, kind, tz), kind),
                         format_x(plot_to_x(entry.hi, kind, tz), kind),
                         entry.label,
+                        entry.color,
                     )
                 )
             else:
-                out.append(TimeRange(entry.lo, entry.hi, entry.label))
+                out.append(TimeRange(entry.lo, entry.hi, entry.label, entry.color))
         return out
 
     def _data_start(self, x: str) -> float | None:
@@ -382,7 +478,7 @@ class ExplorerPage(QWidget):
         data = self.plot.data
         if data is not None and data.x_name == x and data.bounds:
             return data.bounds[0]
-        bounds = data_bounds(self.info, x)
+        bounds = data_bounds(self.info, x, self.scaling_panel.scaling().get(x))
         return x_to_plot(bounds.lo, self.info.x_kind(x)) if bounds else None
 
     def schedule_update(self) -> None:
@@ -425,6 +521,9 @@ class ExplorerPage(QWidget):
         self._overview = data
         self.plot_data = data
         self.plot.set_data(data, keep_view=not x_changed)
+        view, self._next_view = self._next_view, None
+        if view is not None and not x_changed:
+            self.plot.set_x_view(*view, padding=0)
         if spans is not None:
             self.plot.set_ranges(spans)
         self._update_detail_banner()
@@ -545,17 +644,48 @@ class ExplorerPage(QWidget):
     # ----------------------------------------------------------------- ranges
     def _ranges_changed(self) -> None:
         ranges = self.plot.ranges()
-        self.ranges_panel.refresh(ranges)
+        self.ranges_panel.refresh(ranges, self.plot.default_range_color())
         self.bottom_tabs.setTabText(0, f"Ranges ({len(ranges)})" if ranges else "Ranges")
 
     def _range_edited(self, index: int, lo, hi, label) -> None:
         if index >= len(self.plot.ranges()):
             return
         if lo is None and hi is None and label is None:
-            self.ranges_panel.refresh(self.plot.ranges())
+            self.ranges_panel.refresh(self.plot.ranges(), self.plot.default_range_color())
             self.status.emit("Invalid value - use an ISO date/time such as 2024-01-31 12:00:00 or a number")
             return
         self.plot.update_range(index, lo, hi, label)
+
+    # ------------------------------------------------------------ plot output
+    def open_plot_settings(self) -> None:
+        if self.info is None:
+            return
+        data = self.plot.data
+        if data is not None and data.series:
+            x, columns = data.x_name, [s.column for s in data.series]
+        else:
+            x, columns = self.params.x(), self.params.selected_y()
+        dialog = PlotSettingsDialog(self.plot, x, columns, parent=self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.applied.connect(self._plot_style_applied)
+        dialog.open()
+
+    def _plot_style_applied(self) -> None:
+        save_style(self.settings, self.plot.style)
+        self._ranges_changed()  # range colours may follow a new default
+
+    def export_image(self) -> None:
+        if self.info is None or not self.plot.has_plots():
+            return
+        dialog = ImageExportDialog(self.plot, self.settings, self.info.path, parent=self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.saved.connect(lambda path: self.status.emit(f"Saved the plot to {path}"))
+        dialog.open()
+
+    def copy_image(self) -> None:
+        if self.plot.has_plots():
+            self.plot.copy_image()
+            self.status.emit("Copied the plot to the clipboard")
 
     # ------------------------------------------------------------------ misc
     def remember_export_settings(self, cfg: ProcessingConfig) -> None:

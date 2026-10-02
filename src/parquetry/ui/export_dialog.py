@@ -166,6 +166,13 @@ class ExportDialog(QDialog):
         data_form.addRow("Rows", scope_row)
         data_form.addRow("Aggregation", self.agg_combo)
         data_form.addRow("", self.sort_check)
+        scaled = [f"{column} {cfg.scaling_for(column).describe()}" for column in dict.fromkeys([cfg.x, *cfg.y])
+                  if cfg.scaling_for(column) is not None]
+        if scaled:
+            scaling_label = QLabel(", ".join(scaled))
+            scaling_label.setWordWrap(True)
+            scaling_label.setToolTip("Set in the Scaling tab under the plot; values are written converted")
+            data_form.addRow("Scaling", scaling_label)
         for widget in (self.scope_all, self.scope_ranges, self.split_check, self.sort_check):
             widget.toggled.connect(self._scope_changed)
         self.agg_combo.currentIndexChanged.connect(self._agg_changed)

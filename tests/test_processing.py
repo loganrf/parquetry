@@ -5,7 +5,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from parquetry.config import AggregationConfig, CsvOptions, OutputOptions, ProcessingConfig, TimeRange
+from parquetry.config import AggregationConfig, CsvOptions, OutputOptions, ProcessingConfig, Scaling, TimeRange
 from parquetry.dataset import ROW_INDEX, inspect_parquet
 from parquetry.processing import (
     PlotData,
@@ -19,10 +19,14 @@ from parquetry.processing import (
     find_inputs,
     load_plot_data,
     merge_plot_data,
+    load_table_data,
     parse_x_value,
     plan_outputs,
     preview_csv,
+    processed_frame,
     render_output_path,
+    resolve_ranges,
+    validate_for,
 )
 
 from .conftest import START
@@ -375,3 +379,107 @@ def test_merge_keeps_unknown_series():
     merged = merge_plot_data(base, detail)
     assert merged.series[0].x.tolist() == [0, 1, 2.5, 4]
     assert merged.series[1] is base.series[1]
+
+
+# -- scaling ----------------------------------------------------------------------------
+
+
+def test_scaled_y_values(telemetry):
+    scaling = {"speed": Scaling(2, 1), "rpm": Scaling(0.5)}
+    df = run(telemetry, cfg(y=["speed", "rpm", "temp"], scaling=scaling))
+    assert df["speed"].head(3).to_list() == [1.0, 3.0, 5.0]
+    assert df["rpm"].head(3).to_list() == [0.0, 1.0, 2.0] and df["rpm"].dtype == pl.Float64
+    assert df["temp"].head(2).to_list() == [20.0, 21.0]  # not scaled
+    # Scaling applies before aggregation: the sum of converted values.
+    agg = AggregationConfig(method="interval", every="10s", functions=["sum", "max"])
+    df = run(telemetry, cfg(scaling=scaling, aggregation=agg))
+    assert df["speed_sum"][0] == sum(2 * v + 1 for v in range(100)) and df["speed_max"][0] == 199
+
+
+def test_time_offset_shifts_ranges_and_bounds(telemetry):
+    info = inspect_parquet(telemetry)
+    shift = {"time": Scaling(offset="1h")}
+    later = START + dt.timedelta(hours=1)
+    assert data_bounds(info, "time", shift["time"]).lo == later
+    config = cfg(scaling=shift, ranges=[TimeRange("2024-01-01T01:00:10", "2024-01-01T01:00:20")])
+    df = run(telemetry, config)
+    assert df.height == 101 and df["time"][0] == later + dt.timedelta(seconds=10) and df["speed"][0] == 100
+    relative = cfg(scaling=shift, range_mode="relative", ranges=[TimeRange(10, 20)])
+    assert run(telemetry, relative)["speed"].to_list() == df["speed"].to_list()
+    elapsed = run(telemetry, cfg(scaling=shift, csv=CsvOptions(time_format="elapsed_s")))
+    assert elapsed["time"].head(2).to_list() == [0.0, 0.1]
+
+
+def test_ranges_on_scaled_x_still_skip_row_groups(telemetry):
+    info = inspect_parquet(telemetry)
+    config = cfg(scaling={"time": Scaling(offset="1h")}, ranges=[TimeRange("2024-01-01T01:00:10", "2024-01-01T01:00:20")])
+    plan = processed_frame(info, config, resolve_ranges(config, info)).explain()
+    # The scan itself filters the stored times, so Parquet statistics can skip row groups.
+    assert 'SELECTION: (col("time") >= 2024-01-01 00:00:10)' in plan
+
+
+@pytest.mark.parametrize("scaling", [Scaling(0.1), Scaling(-0.1, 3), Scaling(1 / 3, 0.7)])
+def test_stored_value_filter_keeps_range_bounds(numeric_x, scaling):
+    full = run(numeric_x, ProcessingConfig(x="distance", y=["force"], scaling={"distance": scaling}))
+    lo, hi = sorted((scaling.apply(10.0), scaling.apply(20.0)))
+    config = ProcessingConfig(x="distance", y=["force"], scaling={"distance": scaling}, ranges=[TimeRange(lo, hi)])
+    expected = full.filter(pl.col("distance").is_between(lo, hi))
+    assert expected.height == 11 and run(numeric_x, config).equals(expected)
+
+
+def test_scaled_numeric_x(numeric_x):
+    info = inspect_parquet(numeric_x)
+    config = ProcessingConfig(
+        x="distance", y=["force"], scaling={"distance": Scaling(1000)}, ranges=[TimeRange(10_000, 12_000)]
+    )
+    df = run(numeric_x, config)
+    assert df["distance"].to_list() == [10_000.0, 11_000.0, 12_000.0] and df["force"].to_list() == [100, 121, 144]
+    config.ranges = []
+    config.aggregation = AggregationConfig(method="interval", every=25_000, functions=["count"])
+    assert run(numeric_x, config)["force"].to_list() == [25, 25, 25, 25]
+    assert estimate_rows(info, config) == 4  # 0 .. 99,000 in buckets of 25,000
+
+
+def test_scaled_row_index_and_negative_scale(telemetry):
+    info = inspect_parquet(telemetry)
+    seconds = ProcessingConfig(
+        x=ROW_INDEX, y=["rpm"], scaling={ROW_INDEX: Scaling(0.1)},
+        aggregation=AggregationConfig(method="interval", every=1, functions=["mean"]),
+    )
+    df = run(telemetry, seconds)
+    assert df.height == 60 and df["row_index"].head(2).to_list() == [0.0, 1.0] and df["rpm"][0] == 9.0
+    assert estimate_rows(info, seconds) == 60
+    flipped = ProcessingConfig(x=ROW_INDEX, y=["speed"], scaling={ROW_INDEX: Scaling(-1, 599)})
+    df = run(telemetry, flipped)
+    assert df["row_index"].head(2).to_list() == [0.0, 1.0] and df["speed"].head(2).to_list() == [599.0, 598.0]
+    assert data_bounds(info, ROW_INDEX, flipped.scaling[ROW_INDEX]) == data_bounds(info, ROW_INDEX)
+
+
+@pytest.mark.parametrize(
+    "scaling, message",
+    [
+        ({"label": Scaling(2)}, "cannot be scaled"),
+        ({"on": Scaling(2)}, "cannot be scaled"),
+        ({"time": Scaling(2)}, "can only be shifted"),
+        ({"speed": Scaling(offset="2h")}, "is a duration"),
+        ({"speed": Scaling(0)}, "non-zero scale"),
+    ],
+)
+def test_scaling_errors(telemetry, scaling, message):
+    info = inspect_parquet(telemetry)
+    with pytest.raises(ProcessingError, match=message):
+        validate_for(cfg(y=["speed", "label", "on"], scaling=scaling), info)
+    unused = cfg(scaling={"not_selected": Scaling(2), "rpm": Scaling(2)})
+    validate_for(unused, info)  # scalings of other columns do not matter
+
+
+def test_plot_and_table_data_are_scaled(telemetry):
+    info = inspect_parquet(telemetry)
+    config = cfg(scaling={"speed": Scaling(-1), "time": Scaling(offset=60)})
+    data = load_plot_data(info, config)
+    assert data.bounds[0] == pytest.approx((START - dt.datetime(1970, 1, 1)).total_seconds() + 60)
+    assert data.series[0].y[:2].tolist() == [0.0, -1.0]
+    reduced = load_plot_data(info, config, max_points=100, envelope_buckets=10)
+    assert reduced.reduced and np.nanmin(reduced.series[0].y) == -599
+    table = load_table_data(info, config)
+    assert table.frame["speed"][1] == -1.0 and table.frame["time"][0] == START + dt.timedelta(minutes=1)

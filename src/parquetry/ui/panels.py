@@ -1,10 +1,12 @@
-"""Side panels of the explorer: parameters, aggregation and ranges."""
+"""Side panels of the explorer: parameters, aggregation, ranges and scaling."""
 
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -29,11 +31,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import AGG_FUNCTIONS, AGG_METHOD_LABELS, AGG_METHODS, AggregationConfig
+from ..config import AGG_FUNCTIONS, AGG_METHOD_LABELS, AGG_METHODS, AggregationConfig, Scaling, parse_number
 from ..dataset import ROW_INDEX, ROW_INDEX_LABEL, DatasetInfo
 from ..durations import format_seconds, is_duration
 from ..processing import ProcessingError, parse_x_value, x_to_plot
 from .plot_area import RangeEntry, format_plot_x
+from .widgets import ColorButton
 
 _KIND_LABEL = {
     "datetime": "time", "date": "date", "numeric": "number", "duration": "duration", "boolean": "bool", "text": "text",
@@ -451,8 +454,9 @@ class RangePanel(QWidget):
     zoomRequested = Signal(int)
     zoomAllRequested = Signal()
     editRequested = Signal(int, object, object, object)  # index, lo, hi, label
+    colorChanged = Signal(int, str)  # index, colour ("" for the default)
 
-    COLUMNS = ("#", "Label", "Start", "End", "Duration")
+    COLUMNS = ("#", "Colour", "Label", "Start", "End", "Duration")
     _HINT = (
         "No ranges selected - exports include all data. Shift+drag on the plot, use range mode (R) "
         "or “Add from view” to select time ranges for export."
@@ -498,9 +502,10 @@ class RangePanel(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setColumnWidth(0, 36)
-        self.table.setColumnWidth(1, 110)
-        self.table.setColumnWidth(2, 210)
+        self.table.setColumnWidth(1, 56)
+        self.table.setColumnWidth(2, 110)
         self.table.setColumnWidth(3, 210)
+        self.table.setColumnWidth(4, 210)
         self.table.itemChanged.connect(self._item_changed)
         self.table.cellDoubleClicked.connect(lambda row, col: col == 0 and self.zoomRequested.emit(row))
         self.hint = QLabel(self._HINT)
@@ -527,13 +532,14 @@ class RangePanel(QWidget):
         # Time-zone aware columns are displayed (and edited) in UTC.
         self._kind, self._tz = kind, tz
         suffix = " (UTC)" if kind == "datetime" and tz else ""
-        self.table.setHorizontalHeaderLabels(["#", "Label", f"Start{suffix}", f"End{suffix}", "Duration"])
+        self.table.setHorizontalHeaderLabels(["#", "Colour", "Label", f"Start{suffix}", f"End{suffix}", "Duration"])
         allowed = kind != "category"
         self.mode_combo.setEnabled(allowed)
         self.add_button.setEnabled(allowed)
         self.hint.setText(self._HINT if allowed else "Ranges need a numeric or time x axis; the x axis is text.")
 
-    def refresh(self, ranges: list[RangeEntry]) -> None:
+    def refresh(self, ranges: list[RangeEntry], default_color: QColor | str = "#2a78d6") -> None:
+        """Show *ranges*; ranges without a colour of their own are highlighted in *default_color*."""
         self._updating = True
         try:
             selected = self.table.currentRow()
@@ -541,6 +547,7 @@ class RangePanel(QWidget):
             for row, entry in enumerate(ranges):
                 values = [
                     str(row + 1),
+                    "",
                     entry.label,
                     format_plot_x(entry.lo, self._kind),
                     format_plot_x(entry.hi, self._kind),
@@ -548,11 +555,19 @@ class RangePanel(QWidget):
                 ]
                 for col, value in enumerate(values):
                     item = QTableWidgetItem(value)
-                    if col in (0, 4):
+                    if col in (0, 1, 5):
                         item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                    if col in (2, 3):
+                    if col in (3, 4):
                         item.setToolTip("Edit to change the range (ISO date/time or number)")
                     self.table.setItem(row, col, item)
+                button = self.table.cellWidget(row, 1)
+                if not isinstance(button, ColorButton):  # buttons are reused, so they don't flicker while dragging
+                    button = ColorButton(title="Range colour")
+                    button.setAutoRaise(True)
+                    button.colorChanged.connect(lambda color, b=button: self._color_changed(b, color))
+                    self.table.setCellWidget(row, 1, button)
+                button.set_automatic(default_color)
+                button.set_color(entry.color)
             if 0 <= selected < len(ranges):
                 self.table.selectRow(selected)
         finally:
@@ -567,8 +582,10 @@ class RangePanel(QWidget):
         if self._updating:
             return
         row, col = item.row(), item.column()
-        if col == 1:
+        if col == 2:
             self.editRequested.emit(row, None, None, item.text().strip())
+            return
+        if col not in (3, 4):
             return
         try:
             value = parse_x_value(item.text().strip(), self._kind, None)
@@ -576,10 +593,16 @@ class RangePanel(QWidget):
         except ProcessingError:
             self.editRequested.emit(row, None, None, None)  # triggers a refresh with the old value
             return
-        if col == 2:
+        if col == 3:
             self.editRequested.emit(row, plot_value, None, None)
-        elif col == 3:
+        else:
             self.editRequested.emit(row, None, plot_value, None)
+
+    def _color_changed(self, button: ColorButton, color: str) -> None:
+        for row in range(self.table.rowCount()):
+            if self.table.cellWidget(row, 1) is button:
+                self.colorChanged.emit(row, color)
+                return
 
     def _remove_selected(self) -> None:
         row = self.table.currentRow()
@@ -601,3 +624,189 @@ class RangePanel(QWidget):
             return
         super().keyPressEvent(event)
 
+
+
+_SCALABLE = {"numeric", "duration", "datetime", "date"}
+_TEMPORAL = {"datetime", "date"}
+
+
+def format_number(value: float) -> str:
+    return f"{value:.12g}"
+
+
+class ScalingPanel(QWidget):
+    """Scale and offset of the x column and the y parameters: value × scale + offset.
+
+    Scalings of columns that are not shown are kept, so they come back when the
+    column is ticked again.
+    """
+
+    changed = Signal()
+    invalid = Signal(str)
+
+    COLUMNS = ("Column", "Axis", "Scale", "Offset")
+    _HINT = (
+        "Values are converted as value × scale + offset before plotting, ranges, aggregation and export, "
+        "for example a scale of 3.28084 for metres to feet, 1/3.6 for km/h to m/s, or 9/5 with an offset "
+        "of 32 for °C to °F. Times can only be shifted: give the offset in seconds or as a duration such as "
+        "2h or -30m. Ranges use the converted x values."
+    )
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        title = QLabel("<b>Scaling</b>")
+        self.reset_button = QPushButton("Reset")
+        self.reset_button.setToolTip("Use the values of the selected column as they are")
+        self.reset_button.clicked.connect(self._reset_selected)
+        self.reset_all_button = QPushButton("Reset all")
+        self.reset_all_button.setToolTip("Use the values of every column as they are")
+        self.reset_all_button.clicked.connect(self.reset_all)
+        header = QHBoxLayout()
+        header.addWidget(title)
+        header.addStretch(1)
+        header.addWidget(self.reset_button)
+        header.addWidget(self.reset_all_button)
+        self.hint = QLabel(self._HINT)
+        self.hint.setWordWrap(True)
+        self.hint.setStyleSheet("color: palette(placeholder-text);")
+
+        self.table = QTableWidget(0, len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.verticalHeader().hide()
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setColumnWidth(0, 200)
+        self.table.setColumnWidth(1, 44)
+        self.table.setColumnWidth(2, 160)
+        self.table.itemChanged.connect(self._item_changed)
+        self.table.itemSelectionChanged.connect(self._update_buttons)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.addLayout(header)
+        layout.addWidget(self.hint)
+        layout.addWidget(self.table, 1)
+        self._scaling: dict[str, Scaling] = {}
+        #: (column, axis, kind) of the rows.
+        self._rows: list[tuple[str, str, str]] = []
+        self._updating = False
+        self._fill()
+
+    def set_columns(self, info: DatasetInfo, x: str, ys: list[str]) -> None:
+        """Show the x column and the y parameters *ys*."""
+        rows = [(x, "x")] + [(y, "y") for y in dict.fromkeys(ys) if y != x]
+        self._rows = [(name, axis, info.column(name).kind if info.has_column(name) else "other") for name, axis in rows]
+        self._fill()
+
+    def scaling(self) -> dict[str, Scaling]:
+        """Every column's scaling (columns used as they are are left out)."""
+        return dict(self._scaling)
+
+    def set_scaling(self, scaling: dict[str, Scaling]) -> None:
+        self._scaling = {name: s for name, s in scaling.items() if not s.is_identity}
+        self._fill()
+
+    def scaled_count(self) -> int:
+        """Number of shown columns that are scaled."""
+        return sum(1 for name, _, kind in self._rows if kind in _SCALABLE and name in self._scaling)
+
+    def reset_all(self) -> None:
+        if self._scaling:
+            self._scaling.clear()
+            self._fill()
+            self.changed.emit()
+
+    def _reset_selected(self) -> None:
+        row = self.table.currentRow()
+        if 0 <= row < len(self._rows) and self._scaling.pop(self._rows[row][0], None) is not None:
+            self._fill()
+            self.changed.emit()
+
+    def _fill(self) -> None:
+        self._updating = True
+        try:
+            selected = self.table.currentRow()
+            self.table.setRowCount(len(self._rows))
+            for row, (name, axis, kind) in enumerate(self._rows):
+                scaling = self._scaling.get(name) or Scaling()
+                scalable = kind in _SCALABLE
+                temporal = kind in _TEMPORAL
+                column = QTableWidgetItem(ROW_INDEX_LABEL if name == ROW_INDEX else name)
+                column.setToolTip(name)
+                if scalable and name in self._scaling:
+                    font = QFont(column.font())
+                    font.setBold(True)
+                    column.setFont(font)
+                scale = QTableWidgetItem(format_number(scaling.scale) if scalable else "–")
+                offset = QTableWidgetItem(
+                    ("–" if not scalable else scaling.offset if isinstance(scaling.offset, str)
+                     else format_number(scaling.offset))
+                )
+                items = [column, QTableWidgetItem(axis), scale, offset]
+                for col, item in enumerate(items):
+                    editable = scalable and (col == 3 or (col == 2 and not temporal))
+                    if not editable:
+                        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    self.table.setItem(row, col, item)
+                if not scalable:
+                    for item in (scale, offset):
+                        item.setToolTip("Text and boolean values cannot be scaled")
+                elif temporal:
+                    scale.setToolTip("Times can only be shifted with an offset")
+                    offset.setToolTip("Shift in seconds or as a duration such as 2h or -30m (empty: no shift)")
+                else:
+                    scale.setToolTip("Factor, e.g. 3.28084 or 1/3.6 (empty: 1)")
+                    offset.setToolTip(
+                        "Added after scaling" + (", in seconds or as a duration" if kind == "duration" else "")
+                        + " (empty: 0)"
+                    )
+            if 0 <= selected < len(self._rows):
+                self.table.selectRow(selected)
+        finally:
+            self._updating = False
+        self._update_buttons()
+
+    def _update_buttons(self) -> None:
+        row = self.table.currentRow()
+        self.reset_button.setEnabled(0 <= row < len(self._rows) and self._rows[row][0] in self._scaling)
+        self.reset_all_button.setEnabled(bool(self._scaling))
+
+    def _item_changed(self, item: QTableWidgetItem) -> None:
+        if self._updating or item.column() not in (2, 3):
+            return
+        name, _axis, kind = self._rows[item.row()]
+        current = self._scaling.get(name) or Scaling()
+        text = item.text().strip()
+        try:
+            if item.column() == 2:
+                scale = parse_number(text) if text else 1.0
+                if scale == 0:
+                    raise ValueError("The scale must not be zero")
+                new = replace(current, scale=scale)
+            else:
+                new = replace(current, offset=_parse_offset(text, kind))
+        except ValueError as exc:
+            self._fill()  # back to the previous value
+            self.invalid.emit(f"{name}: {exc}")
+            return
+        if new.is_identity:
+            self._scaling.pop(name, None)
+        else:
+            self._scaling[name] = new
+        self._fill()
+        self.changed.emit()
+
+
+def _parse_offset(text: str, kind: str) -> float | str:
+    if not text:
+        return 0.0
+    try:
+        return parse_number(text)
+    except ValueError:
+        if kind in {"datetime", "date", "duration"}:
+            if is_duration(text.lstrip("-").strip()):
+                return text
+            raise ValueError(f"{text!r} is neither a number of seconds nor a duration such as 2h") from None
+        raise
