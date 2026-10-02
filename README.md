@@ -1,6 +1,6 @@
 # Parquetry
 
-** Yes, this is AI slop! User beware! **
+== Yes, this is AI slop! User beware! ==
 
 
 Explore, compact and export large Parquet and CSV files. Parquetry is a desktop
